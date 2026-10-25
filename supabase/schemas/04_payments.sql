@@ -552,6 +552,22 @@ END;
 $$;
 
 
+-- At most 3 unpaid invoices per user. The lock makes simultaneous inserts line up behind each other.
+-- Keep the 3 in sync with MAX_PENDING_PAYMENTS in the webapp.
+CREATE OR REPLACE FUNCTION "payments"."tr_payments_limit_pending"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.user_id::text, 0));
+  IF (SELECT count(*) FROM payments.payments WHERE user_id = NEW.user_id AND status = 'pending') >= 3 THEN
+    RAISE EXCEPTION 'too many pending payments' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
 -- Earnings are money owed to the user, so an account holding any can't be deleted
 CREATE OR REPLACE FUNCTION "payments"."tr_accounts_pre_delete"() RETURNS "trigger"
     LANGUAGE "plpgsql"
@@ -566,6 +582,8 @@ END;
 $$;
 
 -- Triggers
+
+CREATE OR REPLACE TRIGGER "tr_payments_limit_pending" BEFORE INSERT ON "payments"."payments" FOR EACH ROW WHEN (NEW.status = 'pending') EXECUTE FUNCTION "payments"."tr_payments_limit_pending"();
 
 CREATE OR REPLACE TRIGGER "tr_accounts_pre_delete" BEFORE DELETE ON "payments"."accounts" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_accounts_pre_delete"();
 
@@ -622,6 +640,7 @@ REVOKE ALL ON FUNCTION "payments"."transfer_earnings"(bigint) FROM PUBLIC, "anon
 REVOKE ALL ON FUNCTION "payments"."tr_profiles_post_insert"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."tr_ledger_immutable"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."tr_accounts_pre_delete"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."tr_payments_limit_pending"() FROM PUBLIC, "anon", "authenticated";
 
 GRANT EXECUTE ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") TO "service_role";
