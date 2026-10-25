@@ -83,6 +83,14 @@ CREATE TABLE IF NOT EXISTS "scripts"."scripts" (
 );
 
 
+-- Every slug a script has had. scripts.url is the current one; the rest redirect to it.
+-- A slug is never released, so an old link can't end up pointing at someone else's script.
+CREATE TABLE IF NOT EXISTS "scripts"."slugs" (
+    "slug" "text" NOT NULL,
+    "id" "uuid" NOT NULL
+);
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."metadata" (
     "id" "uuid" NOT NULL,
     "type" "scripts"."type" DEFAULT 'free'::"scripts"."type" NOT NULL,
@@ -134,6 +142,14 @@ ALTER TABLE ONLY "scripts"."scripts"
 
 ALTER TABLE ONLY "scripts"."scripts"
     ADD CONSTRAINT "scripts_url_key" UNIQUE ("url");
+
+ALTER TABLE ONLY "scripts"."slugs"
+    ADD CONSTRAINT "slugs_pkey" PRIMARY KEY ("slug");
+
+ALTER TABLE ONLY "scripts"."slugs"
+    ADD CONSTRAINT "slugs_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+CREATE INDEX "slugs_id_idx" ON "scripts"."slugs" ("id");
 
 ALTER TABLE ONLY "scripts"."metadata"
     ADD CONSTRAINT "metadata_pkey" PRIMARY KEY ("id");
@@ -323,17 +339,55 @@ $$;
 
 -- Trigger functions
 
--- The slug is generated once on insert and never changes afterwards, so URLs
--- survive title and username changes. The id suffix keeps it unique.
-CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_pre_insert"() RETURNS "trigger"
-    LANGUAGE "plpgsql"
+-- The slug is the title alone ("auto-fighter") while it is free, and gets the
+-- id suffix ("auto-fighter-1a2b3c4d") only on a collision with another script's
+-- current or past slug. It follows title changes; scripts.slugs keeps the old
+-- ones so their links redirect. Runs as definer because slugs is not readable
+-- for scripts the caller can't view, and uniqueness has to see all of them.
+CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_set_url"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  base text;
+  candidate text;
+  len integer := 8;
+BEGIN
+  base := left(trim(both '-' from regexp_replace(lower(NEW.title), '[^a-z0-9]+', '-', 'g')), 80);
+  base := trim(both '-' from base);
+  IF base = '' THEN base := 'script'; END IF;
+
+  -- Serialise scripts racing for the same slug.
+  PERFORM pg_advisory_xact_lock(hashtext(base));
+
+  -- "new" is the create-script route, so it never gets the clean form.
+  candidate := base;
+  IF base = 'new' OR EXISTS (
+    SELECT 1 FROM "scripts"."slugs" WHERE "slug" = candidate AND "id" <> NEW.id
+  ) THEN
+    LOOP
+      candidate := base || '-' || left(NEW.id::text, len);
+      EXIT WHEN NOT EXISTS (
+        SELECT 1 FROM "scripts"."slugs" WHERE "slug" = candidate AND "id" <> NEW.id
+      );
+      len := len + 4;
+    END LOOP;
+  END IF;
+
+  NEW.url := candidate;
+  RETURN NEW;
+END;
+$$;
+
+
+-- Records the current slug once the scripts row exists (the FK needs it).
+CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_record_url"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     AS $$
 BEGIN
-  NEW.url := trim(both '-' from regexp_replace(lower(NEW.title), '[^a-z0-9]+', '-', 'g'))
-             || '-' || left(NEW.id::text, 8);
-  NEW.url := ltrim(NEW.url, '-');
-  RETURN NEW;
+  INSERT INTO "scripts"."slugs" ("slug", "id") VALUES (NEW.url, NEW.id) ON CONFLICT ("slug") DO NOTHING;
+  RETURN NULL;
 END;
 $$;
 
@@ -505,7 +559,11 @@ $$;
 
 -- Triggers
 
-CREATE OR REPLACE TRIGGER "tr_scripts_pre_insert" BEFORE INSERT ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_pre_insert"();
+CREATE OR REPLACE TRIGGER "tr_scripts_pre_insert" BEFORE INSERT ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_set_url"();
+
+CREATE OR REPLACE TRIGGER "tr_scripts_pre_update" BEFORE UPDATE OF "title" ON "scripts"."scripts" FOR EACH ROW WHEN (OLD."title" IS DISTINCT FROM NEW."title") EXECUTE FUNCTION "scripts"."tr_scripts_set_url"();
+
+CREATE OR REPLACE TRIGGER "tr_scripts_record_url" AFTER INSERT OR UPDATE OF "url" ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_record_url"();
 
 CREATE OR REPLACE TRIGGER "tr_scripts_post_insert" AFTER INSERT ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_post_insert"();
 
@@ -519,12 +577,15 @@ CREATE OR REPLACE TRIGGER "wh-scripts.versions" AFTER UPDATE OF "status" ON "scr
 -- RLS
 
 ALTER TABLE "scripts"."scripts" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "scripts"."slugs" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "scripts"."metadata" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "scripts"."protected" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "scripts"."versions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "scripts"."bundles" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "SELECT for ALLOWED" ON "scripts"."scripts" FOR SELECT USING ("scripts"."can_view"("profiles"."uid"(), "id"));
+
+CREATE POLICY "SELECT for ALLOWED" ON "scripts"."slugs" FOR SELECT USING ("scripts"."can_view"("profiles"."uid"(), "id"));
 
 CREATE POLICY "SELECT for ALLOWED" ON "scripts"."metadata" FOR SELECT USING ("scripts"."can_view"("profiles"."uid"(), "id"));
 
@@ -569,6 +630,8 @@ GRANT USAGE ON SCHEMA "scripts" TO "service_role";
 
 REVOKE ALL ON TABLE "scripts"."scripts", "scripts"."metadata", "scripts"."protected", "scripts"."versions", "scripts"."bundles" FROM "anon", "authenticated";
 
+GRANT SELECT ON TABLE "scripts"."slugs" TO "anon", "authenticated";
+GRANT ALL ON TABLE "scripts"."slugs" TO "service_role";
 GRANT SELECT ON TABLE "scripts"."scripts", "scripts"."metadata", "scripts"."protected", "scripts"."versions", "scripts"."bundles" TO "anon", "authenticated";
 GRANT INSERT ("title", "description", "content") ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT UPDATE ("title", "description", "content", "published") ON TABLE "scripts"."scripts" TO "authenticated";
@@ -580,7 +643,8 @@ GRANT ALL ON TABLE "scripts"."scripts", "scripts"."metadata", "scripts"."protect
 
 -- Functions are executable by PUBLIC by default; lock down the privileged ones.
 -- The policy helpers stay callable by anon because RLS policies call them.
-REVOKE ALL ON FUNCTION "scripts"."tr_scripts_pre_insert"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "scripts"."tr_scripts_set_url"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "scripts"."tr_scripts_record_url"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "scripts"."tr_scripts_post_insert"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "scripts"."tr_metadata_pre_update"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "scripts"."tr_versions_pre_insert"() FROM PUBLIC, "anon", "authenticated";
