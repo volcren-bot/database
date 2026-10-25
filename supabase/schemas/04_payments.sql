@@ -68,15 +68,19 @@ CREATE TABLE IF NOT EXISTS "payments"."payments" (
     "provider_id" "text" NOT NULL,
     "status" "payments"."payment_status" DEFAULT 'pending'::"payments"."payment_status" NOT NULL,
     "credits" bigint NOT NULL,
+    "bonus" bigint DEFAULT 0 NOT NULL,
     "amount" bigint NOT NULL,
     "currency" "text" DEFAULT 'EUR'::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "paid_at" timestamp with time zone,
     CONSTRAINT "payments_credits_check" CHECK ("credits" > 0),
-    CONSTRAINT "payments_amount_check" CHECK ("amount" > 0)
+    CONSTRAINT "payments_amount_check" CHECK ("amount" > 0),
+    CONSTRAINT "payments_bonus_check" CHECK ("bonus" >= 0 AND "bonus" < "credits")
 );
 
-COMMENT ON COLUMN "payments"."payments"."credits" IS 'Credits granted when the payment settles.';
+COMMENT ON COLUMN "payments"."payments"."credits" IS 'Credits granted when the payment settles, bonus included.';
+
+COMMENT ON COLUMN "payments"."payments"."bonus" IS 'Part of credits that is a top-up bonus rather than bought with amount.';
 
 COMMENT ON COLUMN "payments"."payments"."amount" IS 'Amount paid, in the minor unit of currency (cents for EUR). Separate from credits so bonuses and other currencies stay possible.';
 
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS "payments"."credits_ledger" (
     "session_id" "uuid",
     "minutes" integer,
     "note" "text",
+    "granted_by" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     CONSTRAINT "credits_ledger_amount_check" CHECK ("amount" <> 0)
 );
@@ -180,10 +185,12 @@ CREATE INDEX "earnings_ledger_script_id_idx" ON "payments"."earnings_ledger" USI
 
 -- Appends a credits_ledger row and updates the cached balance. A negative
 -- amount that would overdraw the account fails on accounts_credits_check.
+-- p_actor is the human behind a manual entry (see adjust_credits), null otherwise.
 CREATE OR REPLACE FUNCTION "payments"."post_credits"(
     "p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint,
     "p_payment" "uuid" DEFAULT NULL, "p_script" "uuid" DEFAULT NULL,
-    "p_minutes" integer DEFAULT NULL, "p_note" "text" DEFAULT NULL, "p_session" "uuid" DEFAULT NULL
+    "p_minutes" integer DEFAULT NULL, "p_note" "text" DEFAULT NULL, "p_session" "uuid" DEFAULT NULL,
+    "p_actor" "uuid" DEFAULT NULL
 ) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -201,8 +208,8 @@ BEGIN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note)
-  VALUES (p_user, p_kind, p_amount, v_balance, p_payment, p_script, p_session, p_minutes, p_note);
+  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by)
+  VALUES (p_user, p_kind, p_amount, v_balance, p_payment, p_script, p_session, p_minutes, p_note, p_actor);
 
   RETURN v_balance;
 END;
@@ -529,6 +536,32 @@ END;
 $$;
 
 
+-- Manual change to a balance by an administrator, e.g. a goodwill grant or fixing a mistake.
+-- A note is required and the admin is recorded on the ledger row. Called by the API with the
+-- service key, which is why the role is checked here and not taken from auth.uid().
+CREATE OR REPLACE FUNCTION "payments"."adjust_credits"("p_admin" "uuid", "p_user" "uuid", "p_amount" bigint, "p_note" "text") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF p_admin IS NULL OR NOT profiles.is_role(p_admin, 'administrator') THEN
+    RAISE EXCEPTION 'only administrators can adjust credits' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_amount IS NULL OR p_amount = 0 THEN
+    RAISE EXCEPTION 'amount must not be zero';
+  END IF;
+
+  IF p_note IS NULL OR btrim(p_note) = '' THEN
+    RAISE EXCEPTION 'a note is required';
+  END IF;
+
+  RETURN payments.post_credits(p_user, 'adjustment', p_amount, NULL, NULL, NULL, btrim(p_note), NULL, p_admin);
+END;
+$$;
+
+
 -- Trigger functions
 
 CREATE OR REPLACE FUNCTION "payments"."tr_profiles_post_insert"() RETURNS "trigger"
@@ -627,7 +660,8 @@ GRANT SELECT ON TABLE "payments"."accounts", "payments"."payments", "payments"."
 GRANT ALL ON TABLE "payments"."config", "payments"."payments" TO "service_role";
 GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" TO "service_role";
 
-REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "text") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."settle_payment"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."required_balance"(bigint) FROM PUBLIC, "anon", "authenticated";
@@ -642,7 +676,8 @@ REVOKE ALL ON FUNCTION "payments"."tr_ledger_immutable"() FROM PUBLIC, "anon", "
 REVOKE ALL ON FUNCTION "payments"."tr_accounts_pre_delete"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."tr_payments_limit_pending"() FROM PUBLIC, "anon", "authenticated";
 
-GRANT EXECUTE ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."settle_payment"("uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."required_balance"(bigint) TO "service_role";
