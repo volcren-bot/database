@@ -1,0 +1,5 @@
+Name: Sync
+Schedule: 0 3 * * *
+Timeout: 300
+Service: db-utils
+Command: sync
