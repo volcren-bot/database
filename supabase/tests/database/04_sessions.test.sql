@@ -55,7 +55,7 @@ SELECT is(stats.online_count(), 1::bigint, 'an open session counts as online');
 SELECT throws_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'a balance below one minute cannot start a session');
 
 -- a price change during a session does not change what that session pays --------------
-UPDATE scripts.metadata SET price = 100 WHERE id = '10000000-0000-0000-0000-000000000001';
+UPDATE scripts.metadata SET price = 20 WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'a'), interval '5 minutes');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), true, 'a heartbeat charges the elapsed minutes and keeps the session running');
 SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 950::bigint, 'the session pays its own price (5 x 10), not the new one');

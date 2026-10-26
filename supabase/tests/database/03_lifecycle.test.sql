@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(30);
+SELECT plan(39);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -85,7 +85,21 @@ SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000003', '10000000-000
 SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002'), true, 'but the author can view it');
 
 -- price limits ---------------------------------------------------------------------
-SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 10001 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
+SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 23 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
+SELECT lives_ok($$UPDATE scripts.metadata SET type = 'premium', price = 22 WHERE id = '10000000-0000-0000-0000-000000000002'$$, 'the maximum price is allowed');
+
+-- revision file names -----------------------------------------------------------------
+SELECT is(scripts.valid_files(ARRAY['main.luau', 'lib/util.luau', 'a_b-c..d', '.config']), true, 'plain names and subfolders are valid');
+SELECT is(scripts.valid_files('{}'), false, 'a revision needs a file');
+SELECT is(scripts.valid_files((SELECT array_agg('f' || i) FROM generate_series(1, 50) i)), true, '50 files are allowed');
+SELECT is(scripts.valid_files((SELECT array_agg('f' || i) FROM generate_series(1, 51) i)), false, '51 files are not');
+SELECT is(scripts.valid_files(ARRAY['main.luau', 'main.luau']), false, 'file names must be unique');
+SELECT is((SELECT bool_or(scripts.valid_files(ARRAY[f])) FROM unnest(ARRAY['../x', 'a/../b', '.', 'a/./b', '/a', 'a/', 'a//b', 'a b', 'a\b', 'ä', repeat('a', 201)]) f), false, 'traversal, empty segments, other characters and long names are rejected');
+SELECT is(scripts.valid_files(ARRAY[NULL::text]), false, 'a null file name is rejected');
+SET LOCAL ROLE authenticated;
+SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
+SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000002', ARRAY['../escape.luau'])$$, '23514', NULL, 'an author cannot insert a revision with an invalid file name');
+RESET ROLE;
 
 -- deleting accounts -------------------------------------------------------------------
 SELECT throws_ok($$DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-000000000001'$$, '23503', NULL, 'a user who authors scripts cannot be deleted');

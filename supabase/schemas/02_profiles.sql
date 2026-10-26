@@ -53,6 +53,19 @@ ALTER TABLE ONLY "profiles"."profiles"
 ALTER TABLE ONLY "profiles"."profiles"
     ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
+-- Append-only record of administrators logging in as other users (the admin page's
+-- impersonate action), written by log_impersonation. No FKs on purpose, like the
+-- payments ledgers: the record outlives both accounts.
+CREATE TABLE IF NOT EXISTS "profiles"."impersonations" (
+    "id" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    "admin_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "profiles"."impersonations"
+    ADD CONSTRAINT "impersonations_pkey" PRIMARY KEY ("id");
+
 -- Functions
 
 CREATE OR REPLACE FUNCTION "profiles"."uid"() RETURNS "uuid"
@@ -250,6 +263,44 @@ $$;
 
 CREATE OR REPLACE TRIGGER "profiles_require_discord" BEFORE INSERT ON "auth"."users" FOR EACH ROW EXECUTE FUNCTION "profiles"."require_discord"();
 
+-- Records an impersonation; the webapp calls it (service_role) before creating the
+-- login, so an impersonation that can't be recorded doesn't happen. Administrators
+-- can't impersonate each other.
+CREATE OR REPLACE FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF p_admin IS NULL OR NOT profiles.is_role(p_admin, 'administrator') THEN
+    RAISE EXCEPTION 'only administrators can impersonate' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM profiles.profiles WHERE id = p_user) THEN
+    RAISE EXCEPTION 'user % not found', p_user USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF profiles.min_role(p_user, 'administrator') THEN
+    RAISE EXCEPTION 'administrators cannot be impersonated' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  INSERT INTO profiles.impersonations (admin_id, user_id) VALUES (p_admin, p_user);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "profiles"."tr_impersonations_immutable"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER "tr_impersonations_immutable" BEFORE UPDATE OR DELETE ON "profiles"."impersonations" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+CREATE OR REPLACE TRIGGER "tr_impersonations_truncate" BEFORE TRUNCATE ON "profiles"."impersonations" FOR EACH STATEMENT EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
 -- Triggers on auth tables. Both BEFORE triggers run ahead of the AFTER one.
 CREATE OR REPLACE TRIGGER "profiles_scrub_user_email" BEFORE INSERT OR UPDATE ON "auth"."users" FOR EACH ROW EXECUTE FUNCTION "profiles"."scrub_user_email"();
 
@@ -269,6 +320,9 @@ CREATE POLICY "UPDATE for OWNER" ON "profiles"."profiles" FOR UPDATE TO "authent
     USING (("id" = ( SELECT "auth"."uid"() AS "uid")))
     WITH CHECK (("id" = ( SELECT "auth"."uid"() AS "uid")));
 
+-- No policies: only service_role (the admin page) reads impersonations
+ALTER TABLE "profiles"."impersonations" ENABLE ROW LEVEL SECURITY;
+
 -- Grants
 
 GRANT USAGE ON SCHEMA "profiles" TO "anon";
@@ -281,6 +335,10 @@ GRANT SELECT ON TABLE "profiles"."profiles" TO "anon", "authenticated";
 GRANT UPDATE ("username") ON TABLE "profiles"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "profiles"."profiles" TO "service_role";
 
+-- Rows are only added by log_impersonation
+REVOKE ALL ON TABLE "profiles"."impersonations" FROM "anon", "authenticated", "service_role";
+GRANT SELECT ON TABLE "profiles"."impersonations" TO "service_role";
+
 -- Functions are executable by PUBLIC by default; lock down the privileged ones.
 -- Revoking PUBLIC also drops anon, so the policy helpers are re-granted below.
 REVOKE ALL ON FUNCTION "profiles"."handle_new_user"() FROM PUBLIC, "anon", "authenticated";
@@ -292,6 +350,9 @@ REVOKE ALL ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id"
 REVOKE ALL ON FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "profiles"."tr_impersonations_immutable"() FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id" "text") TO "service_role";

@@ -98,10 +98,10 @@ CREATE TABLE IF NOT EXISTS "scripts"."metadata" (
     "stage" "scripts"."stage" DEFAULT 'prototype'::"scripts"."stage" NOT NULL,
     "price" bigint DEFAULT 0 NOT NULL,
     CONSTRAINT "metadata_price_check" CHECK (("price" >= 0) AND (("type" = 'free'::"scripts"."type") = ("price" = 0))),
-    CONSTRAINT "metadata_price_max_check" CHECK ("price" <= 10000)
+    CONSTRAINT "metadata_price_max_check" CHECK ("price" <= 22)
 );
 
-COMMENT ON COLUMN "scripts"."metadata"."price" IS 'Credits (1 credit = 0.01 cent EUR, 10,000 credits = 1 EUR) charged per minute of use. 0 for free scripts, 1 to 10,000 for premium ones. The maximum is a constant because a CHECK can''t read payments.config.';
+COMMENT ON COLUMN "scripts"."metadata"."price" IS 'Credits (1 credit = 0.01 cent EUR, 10,000 credits = 1 EUR) charged per minute of use. 0 for free scripts, 1 to 22 for premium ones: 22 a minute is about 98 EUR for a 31-day month of nonstop use, so no script costs more than 100 EUR a month. The maximum is a constant because a CHECK can''t read payments.config.';
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."protected" (
@@ -118,6 +118,26 @@ COMMENT ON COLUMN "scripts"."protected"."revision" IS 'The live revision. 0 mean
 COMMENT ON COLUMN "scripts"."protected"."last_revision" IS 'Revision allocator. Counts pending and discarded revisions too.';
 
 
+-- The file list of a revision, checked by versions_files_check (defined before the table
+-- because the CHECK calls it): 1 to 50 unique paths of at most 200 characters, made of
+-- letters, digits, _ . - and / between segments, with no "." or ".." segment. The webapp
+-- applies the same rules (validFileName in #lib/scripts).
+CREATE OR REPLACE FUNCTION "scripts"."valid_files"("files" "text"[]) RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT cardinality(files) BETWEEN 1 AND 50
+    AND cardinality(files) = (SELECT count(DISTINCT f) FROM unnest(files) f)
+    AND NOT EXISTS (
+      SELECT 1 FROM unnest(files) f
+      WHERE f IS NULL
+         OR char_length(f) > 200
+         OR f !~ '^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$'
+         OR f ~ '(^|/)\.\.?(/|$)'
+    );
+$$;
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "id" "uuid" NOT NULL,
     "revision" integer NOT NULL,
@@ -125,7 +145,7 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "status" "scripts"."version_status" DEFAULT 'pending'::"scripts"."version_status" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "published_at" timestamp with time zone,
-    CONSTRAINT "versions_files_check" CHECK (cardinality("files") > 0)
+    CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files"))
 );
 
 
@@ -736,6 +756,9 @@ GRANT EXECUTE ON FUNCTION "scripts"."can_upload"("object_name" "text") TO "authe
 GRANT EXECUTE ON FUNCTION "scripts"."is_object_author"("user_id" "uuid", "object_name" "text") TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."get_revision"("script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."safe_uuid"("value" "text") TO "anon", "authenticated", "service_role";
+-- Called by versions_files_check, so whoever inserts a revision needs it
+REVOKE ALL ON FUNCTION "scripts"."valid_files"("files" "text"[]) FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "scripts"."valid_files"("files" "text"[]) TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_premium"("script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon", "authenticated", "service_role";
