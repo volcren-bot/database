@@ -177,6 +177,9 @@ CREATE INDEX "payments_user_id_idx" ON "payments"."payments" USING "btree" ("use
 
 CREATE INDEX "credits_ledger_user_id_idx" ON "payments"."credits_ledger" USING "btree" ("user_id", "id" DESC);
 
+-- The admin page lists staff adjustments, which are rare among the per-minute usage rows
+CREATE INDEX "credits_ledger_adjustments_idx" ON "payments"."credits_ledger" USING "btree" ("id" DESC) WHERE ("kind" = 'adjustment'::"payments"."credit_kind");
+
 CREATE INDEX "earnings_ledger_user_id_idx" ON "payments"."earnings_ledger" USING "btree" ("user_id", "id" DESC);
 
 CREATE INDEX "earnings_ledger_script_id_idx" ON "payments"."earnings_ledger" USING "btree" ("script_id");

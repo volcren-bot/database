@@ -151,18 +151,23 @@ CREATE OR REPLACE FUNCTION "stats"."online_count"() RETURNS bigint
     AND s.last_seen > now() - make_interval(mins => (SELECT c.session_timeout_minutes FROM payments.config c));
 $$;
 
--- Online sessions per script, only for scripts the caller can view
+-- Online sessions per script, only for scripts the caller can view. Counted first so can_view
+-- runs once per script, not once per session; MATERIALIZED stops the planner pushing it back down.
 CREATE OR REPLACE FUNCTION "stats"."online_per_script"() RETURNS TABLE ("script_id" "uuid", "users" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
     AS $$
-  SELECT s.script_id, count(DISTINCT s.user_id)
-  FROM payments.sessions s
-  WHERE s.ended_at IS NULL
-    AND s.last_seen > now() - make_interval(mins => (SELECT c.session_timeout_minutes FROM payments.config c))
-    AND scripts.can_view(profiles.uid(), s.script_id)
-  GROUP BY s.script_id;
+  WITH online AS MATERIALIZED (
+    SELECT s.script_id, count(DISTINCT s.user_id) AS users
+    FROM payments.sessions s
+    WHERE s.ended_at IS NULL
+      AND s.last_seen > now() - make_interval(mins => (SELECT c.session_timeout_minutes FROM payments.config c))
+    GROUP BY s.script_id
+  )
+  SELECT o.script_id, o.users
+  FROM online o
+  WHERE scripts.can_view(profiles.uid(), o.script_id);
 $$;
 
 -- Keys
