@@ -30,8 +30,12 @@ CREATE TABLE IF NOT EXISTS "profiles"."profiles" (
     "username" "text" NOT NULL,
     "avatar" "text" DEFAULT ''::"text" NOT NULL,
     "role" "profiles"."roles" DEFAULT 'user'::"profiles"."roles" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "banned_at" timestamp with time zone
 );
+
+
+COMMENT ON COLUMN "profiles"."profiles"."banned_at" IS 'Set while the account is banned. Only profiles.set_banned writes it.';
 
 
 ALTER TABLE ONLY "profiles"."profiles"
@@ -65,6 +69,21 @@ CREATE TABLE IF NOT EXISTS "profiles"."impersonations" (
 
 ALTER TABLE ONLY "profiles"."impersonations"
     ADD CONSTRAINT "impersonations_pkey" PRIMARY KEY ("id");
+
+-- Append-only record of every ban and unban (banned = false), written by set_banned.
+-- No FKs, like impersonations.
+CREATE TABLE IF NOT EXISTS "profiles"."bans" (
+    "id" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+    "admin_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "banned" boolean NOT NULL,
+    "reason" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "bans_reason_check" CHECK ("reason" = btrim("reason") AND char_length("reason") BETWEEN 1 AND 500)
+);
+
+ALTER TABLE ONLY "profiles"."bans"
+    ADD CONSTRAINT "bans_pkey" PRIMARY KEY ("id");
 
 -- Functions
 
@@ -113,6 +132,15 @@ CREATE OR REPLACE FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role"
     (SELECT p.role >= target_role FROM profiles.profiles p WHERE p.id = user_id),
     false
   );
+$$;
+
+
+CREATE OR REPLACE FUNCTION "profiles"."is_banned"("user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT EXISTS (SELECT 1 FROM profiles.profiles p WHERE p.id = user_id AND p.banned_at IS NOT NULL);
 $$;
 
 
@@ -288,6 +316,54 @@ BEGIN
 END;
 $$;
 
+-- Bans or unbans an account; the admin page calls it (service_role), then mirrors the state
+-- to Auth (ban_duration) so a banned user can't sign in or refresh a session either. A ban
+-- ends the user's running scripts, and banned users can't start scripts or publish revisions
+-- (start_session, publish_version, use_deploy_token). Administrators can't be banned.
+-- Returns false, recording nothing, when the account is already in that state.
+CREATE OR REPLACE FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF p_admin IS NULL OR NOT profiles.is_role(p_admin, 'administrator') THEN
+    RAISE EXCEPTION 'only administrators can ban' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_banned IS NULL THEN
+    RAISE EXCEPTION 'p_banned must not be null';
+  END IF;
+
+  IF p_reason IS NULL OR btrim(p_reason) = '' THEN
+    RAISE EXCEPTION 'a reason is required';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM profiles.profiles WHERE id = p_user) THEN
+    RAISE EXCEPTION 'user % not found', p_user USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF profiles.min_role(p_user, 'administrator') THEN
+    RAISE EXCEPTION 'administrators cannot be banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  UPDATE profiles.profiles SET banned_at = CASE WHEN p_banned THEN now() END
+  WHERE id = p_user AND (banned_at IS NOT NULL) <> p_banned;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  INSERT INTO profiles.bans (admin_id, user_id, banned, reason) VALUES (p_admin, p_user, p_banned, btrim(p_reason));
+
+  IF p_banned THEN
+    PERFORM payments.end_user_sessions(p_user);
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION "profiles"."tr_impersonations_immutable"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -300,6 +376,11 @@ $$;
 CREATE OR REPLACE TRIGGER "tr_impersonations_immutable" BEFORE UPDATE OR DELETE ON "profiles"."impersonations" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
 
 CREATE OR REPLACE TRIGGER "tr_impersonations_truncate" BEFORE TRUNCATE ON "profiles"."impersonations" FOR EACH STATEMENT EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+-- The ban record reuses the impersonations guard (its message names the table)
+CREATE OR REPLACE TRIGGER "tr_bans_immutable" BEFORE UPDATE OR DELETE ON "profiles"."bans" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+CREATE OR REPLACE TRIGGER "tr_bans_truncate" BEFORE TRUNCATE ON "profiles"."bans" FOR EACH STATEMENT EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
 
 -- Triggers on auth tables. Both BEFORE triggers run ahead of the AFTER one.
 CREATE OR REPLACE TRIGGER "profiles_scrub_user_email" BEFORE INSERT OR UPDATE ON "auth"."users" FOR EACH ROW EXECUTE FUNCTION "profiles"."scrub_user_email"();
@@ -323,8 +404,9 @@ CREATE POLICY "UPDATE for OWNER" ON "profiles"."profiles" FOR UPDATE TO "authent
     USING (("id" = ( SELECT "auth"."uid"() AS "uid")))
     WITH CHECK (("id" = ( SELECT "auth"."uid"() AS "uid")));
 
--- No policies: only service_role (the admin page) reads impersonations
+-- No policies: only service_role (the admin page) reads impersonations and bans
 ALTER TABLE "profiles"."impersonations" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "profiles"."bans" ENABLE ROW LEVEL SECURITY;
 
 -- Grants
 
@@ -342,6 +424,10 @@ GRANT ALL ON TABLE "profiles"."profiles" TO "service_role";
 REVOKE ALL ON TABLE "profiles"."impersonations" FROM "anon", "authenticated", "service_role";
 GRANT SELECT ON TABLE "profiles"."impersonations" TO "service_role";
 
+-- Rows are only added by set_banned
+REVOKE ALL ON TABLE "profiles"."bans" FROM "anon", "authenticated", "service_role";
+GRANT SELECT ON TABLE "profiles"."bans" TO "service_role";
+
 -- Functions are executable by PUBLIC by default; lock down the privileged ones.
 -- Revoking PUBLIC also drops anon, so the policy helpers are re-granted below.
 REVOKE ALL ON FUNCTION "profiles"."handle_new_user"() FROM PUBLIC, "anon", "authenticated";
@@ -355,7 +441,11 @@ REVOKE ALL ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") F
 REVOKE ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."tr_impersonations_immutable"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") FROM PUBLIC, "anon", "authenticated";
 GRANT EXECUTE ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") TO "service_role";
+GRANT EXECUTE ON FUNCTION "profiles"."is_banned"("user_id" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id" "text") TO "service_role";

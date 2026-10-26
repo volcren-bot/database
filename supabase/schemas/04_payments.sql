@@ -382,6 +382,10 @@ DECLARE
   v_files text[];
   v_id uuid;
 BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
   IF NOT scripts.can_access(p_user, p_script) THEN
     RAISE EXCEPTION 'script not accessible' USING ERRCODE = 'insufficient_privilege';
   END IF;
@@ -493,6 +497,28 @@ BEGIN
   END IF;
 
   RETURN true;
+END;
+$$;
+
+-- Ends and charges every running session of a user: when they are banned (profiles.set_banned)
+-- and before their account is deleted (tr_profiles_pre_delete). Returns how many it ended.
+CREATE OR REPLACE FUNCTION "payments"."end_user_sessions"("p_user" "uuid") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_id uuid;
+  v_count integer := 0;
+BEGIN
+  FOR v_id IN
+    SELECT id FROM payments.sessions WHERE user_id = p_user AND ended_at IS NULL
+  LOOP
+    PERFORM payments.end_session(v_id, 'stopped');
+    v_count := v_count + 1;
+  END LOOP;
+
+  RETURN v_count;
 END;
 $$;
 
@@ -622,6 +648,18 @@ END;
 $$;
 
 
+-- A deleted account's running scripts are charged up to now while its balance still exists
+CREATE OR REPLACE FUNCTION "payments"."tr_profiles_pre_delete"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  PERFORM payments.end_user_sessions(OLD.id);
+  RETURN OLD;
+END;
+$$;
+
+
 -- Earnings are money owed to the user, so an account holding any can't be deleted
 CREATE OR REPLACE FUNCTION "payments"."tr_accounts_pre_delete"() RETURNS "trigger"
     LANGUAGE "plpgsql"
@@ -642,6 +680,8 @@ CREATE OR REPLACE TRIGGER "tr_payments_limit_pending" BEFORE INSERT ON "payments
 CREATE OR REPLACE TRIGGER "tr_accounts_pre_delete" BEFORE DELETE ON "payments"."accounts" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_accounts_pre_delete"();
 
 CREATE OR REPLACE TRIGGER "tr_profiles_post_insert" AFTER INSERT ON "profiles"."profiles" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_profiles_post_insert"();
+
+CREATE OR REPLACE TRIGGER "tr_profiles_pre_delete" BEFORE DELETE ON "profiles"."profiles" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_profiles_pre_delete"();
 
 CREATE OR REPLACE TRIGGER "tr_ledger_immutable" BEFORE UPDATE OR DELETE ON "payments"."credits_ledger" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_ledger_immutable"();
 
@@ -692,6 +732,8 @@ REVOKE ALL ON FUNCTION "payments"."start_session"("uuid", "uuid") FROM PUBLIC, "
 REVOKE ALL ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."heartbeat_session"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_stale_sessions"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."end_user_sessions"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."tr_profiles_pre_delete"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."transfer_earnings"(bigint) FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "payments"."tr_profiles_post_insert"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."tr_ledger_immutable"() FROM PUBLIC, "anon", "authenticated";

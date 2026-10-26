@@ -552,8 +552,8 @@ CREATE OR REPLACE FUNCTION "scripts"."is_object_author"("user_id" "uuid", "objec
 $$;
 
 -- Makes a pending revision live once every listed file exists in the bucket.
--- Moderator+ may publish any script. service_role is the deploy-token endpoint,
--- which checks the token first (use_deploy_token).
+-- Moderator+ may publish any script; banned users can't publish. service_role is the
+-- deploy-token endpoint, which checks the token first (use_deploy_token).
 CREATE OR REPLACE FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -563,7 +563,7 @@ DECLARE
   v_version scripts.versions;
   v_file text;
 BEGIN
-  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR NOT (
+  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
     scripts.is_author(auth.uid(), script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
   )) THEN
     RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
@@ -623,7 +623,8 @@ END;
 $$;
 
 -- Checks a deploy token (by its SHA-256) for a script and records its use. The token
--- only works while whoever made it may still publish the script: its author or moderator+.
+-- only works while whoever made it may still publish the script: its author or moderator+,
+-- and not banned.
 -- Called by the webapp's deploy endpoint with service_role, before it creates the revision.
 CREATE OR REPLACE FUNCTION "scripts"."use_deploy_token"("p_script" "uuid", "p_token_hash" "text") RETURNS "uuid"
     LANGUAGE "plpgsql"
@@ -635,6 +636,7 @@ BEGIN
   UPDATE scripts.deploy_tokens t SET last_used_at = now()
   WHERE t.script_id = p_script AND t.token_hash = p_token_hash
     AND (scripts.is_author(t.created_by, t.script_id) OR profiles.min_role(t.created_by, 'moderator'::profiles.roles))
+    AND NOT profiles.is_banned(t.created_by)
   RETURNING t.id INTO v_id;
 
   IF NOT FOUND THEN
