@@ -59,8 +59,9 @@ $$;
 -- user's totals, the script's totals and the script's custom trackers in a single transaction.
 -- A rejected report raises (check_violation) and changes nothing.
 CREATE OR REPLACE FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[] DEFAULT '{}'::bigint[]) RETURNS "void"
-    LANGUAGE "plpgsql"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
+    SET "row_security" TO 'off'
     AS $$
 DECLARE
   v_session payments.sessions%ROWTYPE;

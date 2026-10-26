@@ -39,6 +39,8 @@ INSERT INTO payments.sessions (id, user_id, script_id, author_id, revision, pric
 VALUES ('30000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000002',
         '10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 1, 0, now(), 'stopped');
 
+-- as the API calls it, which has no direct grants on payments.sessions
+SET LOCAL ROLE service_role;
 SELECT lives_ok($$SELECT stats.report_session('30000000-0000-0000-0000-000000000001', 500, 70, 1, '{3,20}')$$,
   'a report within the limits is accepted');
 SELECT results_eq($$SELECT experience, gold, runtime FROM stats.stats WHERE id = '00000000-0000-0000-0000-000000000002'$$,
@@ -68,6 +70,7 @@ SELECT throws_ok($$SELECT stats.report_session('30000000-0000-0000-0000-00000000
 SELECT throws_ok($$SELECT stats.report_session('30000000-0000-0000-0000-000000000009', 500, 0, 1)$$, 'P0002', NULL,
   'an unknown session can not report');
 
+RESET ROLE;
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000002","role":"authenticated"}', true);
 SET LOCAL ROLE authenticated;
 SELECT throws_ok($$SELECT stats.report_session('30000000-0000-0000-0000-000000000001', 500, 0, 1)$$, '42501', NULL,
