@@ -286,6 +286,24 @@ CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETUR
   SELECT p_price * min_balance_minutes FROM payments.config;
 $$;
 
+-- Average per-minute price of the paid scripts users can run (published, beta or stable, with a
+-- live revision), for the credits page's monthly estimate. NULL when there are none. Definer so
+-- it sees every such script whatever the caller's role; it only exposes the one number.
+CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT avg(m.price)
+  FROM scripts.scripts s
+  JOIN scripts.metadata m ON m.id = s.id
+  JOIN scripts.protected p ON p.id = s.id
+  WHERE s.published
+    AND m.price > 0
+    AND p.revision > 0
+    AND m.stage IN ('beta'::scripts.stage, 'stable'::scripts.stage);
+$$;
+
 -- Charges a session for p_minutes at the price it started with. Internal: only
 -- start/heartbeat/end_session call it, with the session row already locked.
 -- Debits up to the available balance and records any shortfall in
@@ -668,6 +686,7 @@ REVOKE ALL ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "text
 REVOKE ALL ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."settle_payment"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."required_balance"(bigint) FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."average_price"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."charge_session"("uuid", integer) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."start_session"("uuid", "uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end") FROM PUBLIC, "anon", "authenticated";
@@ -684,6 +703,8 @@ GRANT EXECUTE ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "t
 GRANT EXECUTE ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."settle_payment"("uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."required_balance"(bigint) TO "service_role";
+-- The credits page is for logged-in users only
+GRANT EXECUTE ON FUNCTION "payments"."average_price"() TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."start_session"("uuid", "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."heartbeat_session"("uuid") TO "service_role";
