@@ -12,7 +12,7 @@ The Supabase backend for [Volcren](https://volcren.com): Postgres schema, migrat
 | `payments` | Credit and earnings ledgers, cached balances, payments from providers, and per-minute usage sessions. |
 | `stats`    | Per-user and per-script stats, sanity limits, online counts, website download tracking. |
 | `info`     | Versioned legal documents (privacy policy, user ToS, scripter ToS). |
-| `storage`  | RLS policies for the `scripts`, `imgs`, `assets` and `launcher` buckets. |
+| `storage`  | RLS policies for the `scripts`, `imgs`, `assets` and `client` buckets. |
 
 ### Key ideas
 
