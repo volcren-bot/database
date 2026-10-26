@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(8);
+SELECT plan(11);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -30,9 +30,12 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'Viewer');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'Moderator', 'moderator');
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', true);
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000002', false);
+SELECT stats.increment_user_stats('00000000-0000-0000-0000-000000000001', 100, 10, 60);
+SELECT stats.increment_user_stats('00000000-0000-0000-0000-000000000003', 200, 20, 120);
 
 SET LOCAL ROLE anon;
 SELECT throws_ok('SELECT * FROM profiles.profiles', '42501', NULL, 'anonymous visitors cannot read profiles');
+SELECT throws_ok('SELECT * FROM stats.stats', '42501', NULL, 'anonymous visitors cannot read user stats');
 SELECT results_eq(
   $$SELECT script_id, username FROM scripts.get_authors(ARRAY['10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002']::uuid[])$$,
   $$VALUES ('10000000-0000-0000-0000-000000000001'::uuid, 'Author')$$,
@@ -42,6 +45,7 @@ RESET ROLE;
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000003","role":"authenticated"}', true);
 SET LOCAL ROLE authenticated;
 SELECT results_eq('SELECT username FROM profiles.profiles', $$VALUES ('Viewer')$$, 'a user reads only their own profile');
+SELECT results_eq('SELECT experience FROM stats.stats', $$VALUES (200::bigint)$$, 'a user reads only their own stats');
 SELECT is_empty(
   $$SELECT * FROM scripts.get_authors(ARRAY['10000000-0000-0000-0000-000000000002']::uuid[])$$,
   'a user does not see the author of a script hidden from them');
@@ -62,6 +66,7 @@ SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-0000000
 SET LOCAL ROLE authenticated;
 SELECT is((SELECT count(*)::int FROM profiles.profiles WHERE id::text LIKE '00000000-0000-0000-0000-00000000000_'), 4, 'a moderator reads every profile');
 SELECT is((SELECT avatar FROM profiles.profiles WHERE id = '00000000-0000-0000-0000-000000000001'), '', 'including avatars');
+SELECT is((SELECT experience FROM stats.stats WHERE id = '00000000-0000-0000-0000-000000000001'), 100::bigint, 'and every user''s stats');
 RESET ROLE;
 
 SELECT * FROM finish();

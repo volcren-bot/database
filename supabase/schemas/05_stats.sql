@@ -6,9 +6,9 @@
 -- Rows for a script are created by scripts.tr_scripts_post_insert. Only
 -- service_role writes values; authors may edit their script's limits.
 --
--- Visibility: only per-user stats (stats.stats) and the online counts
--- (online_count, online_per_script) are public. Everything else is readable
--- only by the script's author and moderator+ (totals: service_role only).
+-- Visibility: only the online counts (online_count, online_per_script) are public.
+-- Per-user stats (stats.stats) are readable by the user and moderator+, everything
+-- else only by the script's author and moderator+ (totals: service_role only).
 -- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
 
 
@@ -224,7 +224,7 @@ ALTER TABLE "stats"."values_custom" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "stats"."website" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "stats"."website_monthly" ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "SELECT for EVERYONE" ON "stats"."stats" FOR SELECT USING (true);
+CREATE POLICY "SELECT for OWNER and MODERATOR" ON "stats"."stats" FOR SELECT TO "authenticated" USING ((("id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
 
 CREATE POLICY "SELECT for OWNER" ON "stats"."limits" FOR SELECT TO "authenticated" USING ("stats"."can_manage"("id"));
 
@@ -248,7 +248,7 @@ GRANT USAGE ON SCHEMA "stats" TO "anon", "authenticated", "service_role";
 
 REVOKE ALL ON TABLE "stats"."limits", "stats"."limits_custom", "stats"."stats", "stats"."totals", "stats"."values", "stats"."values_custom", "stats"."website", "stats"."website_monthly" FROM "anon", "authenticated";
 
-GRANT SELECT ON TABLE "stats"."stats" TO "anon", "authenticated";
+GRANT SELECT ON TABLE "stats"."stats" TO "authenticated";
 GRANT SELECT ON TABLE "stats"."limits", "stats"."limits_custom", "stats"."values", "stats"."values_custom", "stats"."website", "stats"."website_monthly" TO "authenticated";
 GRANT UPDATE ("xp_min", "xp_max", "gp_min", "gp_max") ON TABLE "stats"."limits" TO "authenticated";
 GRANT UPDATE ("trackers", "minima", "maxima") ON TABLE "stats"."limits_custom" TO "authenticated";
