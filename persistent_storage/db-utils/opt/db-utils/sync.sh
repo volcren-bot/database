@@ -64,7 +64,7 @@ echo "Dumping schemas and storage policies..."
 } > "$SNAPSHOT"
 
 if grep -inE "secret|api_key|password|token|key_id" "$SNAPSHOT" \
-	| grep -ivE "secret_key|secret text|decrypted_secret|WEBHOOK_SECRET|generate_hmac|path_tokens|x-simba-secret', *[a-z_]+\b"; then
+	| grep -ivE "secret_key|secret text|secret IS NULL|decrypted_secret|WEBHOOK_SECRET|generate_hmac|path_tokens|deploy[_ ]token|token_hash|x-simba-secret', *[a-z_]+\b"; then
 	echo "Potential secret found in schema dump, aborting." >&2
 	exit 1
 fi

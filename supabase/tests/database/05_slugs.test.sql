@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(14);
+SELECT plan(15);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -48,6 +48,11 @@ UPDATE scripts.scripts SET title = 'Auto Fighter' WHERE id = '10000000-0000-0000
 SELECT is(pg_temp.url_of('10000000-0000-0000-0000-000000000001'), 'auto-fighter', 'renaming back reuses the original slug');
 SELECT is((SELECT count(*)::int FROM scripts.slugs WHERE id = '10000000-0000-0000-0000-000000000001'), 2, 'and it is not recorded twice');
 
+SELECT pg_temp.act('00000000-0000-0000-0000-000000000002');
+INSERT INTO scripts.scripts (id, title, description, content) VALUES ('60000000-0000-0000-0000-000000000006', 'Auto Fighter Pro', 'd', 'c');
+SELECT is(pg_temp.url_of('60000000-0000-0000-0000-000000000006'), 'auto-fighter-pro-60000000', 'a slug left by a rename is not given to another script');
+SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
+
 INSERT INTO scripts.scripts (id, title, description, content) VALUES ('40000000-0000-0000-0000-000000000004', 'New', 'd', 'c');
 SELECT is(pg_temp.url_of('40000000-0000-0000-0000-000000000004'), 'new-40000000', 'a title that matches the create route gets the suffix');
 
@@ -62,6 +67,7 @@ SELECT throws_ok($$INSERT INTO scripts.slugs (slug, id) VALUES ('hijack', '10000
 SELECT is((SELECT count(*)::int FROM scripts.slugs WHERE id = '10000000-0000-0000-0000-000000000001'), 2, 'an author sees the slugs of their own script');
 
 SET LOCAL ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', true);
 SELECT is((SELECT count(*)::int FROM scripts.slugs), 0, 'anonymous visitors see no slugs of unpublished scripts');
 
 SELECT * FROM finish();
