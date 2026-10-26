@@ -386,6 +386,20 @@ CREATE OR REPLACE FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" 
       ), false);
 $$;
 
+-- Author usernames for the scripts in script_ids that the caller can view. Profiles are private,
+-- so this is the only way other users see a name, and only a script author's name.
+CREATE OR REPLACE FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) RETURNS TABLE ("script_id" "uuid", "username" "text")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT p.id, u.username
+  FROM scripts.protected p
+  JOIN profiles.profiles u ON u.id = p.author
+  WHERE p.id = ANY(get_authors.script_ids)
+    AND scripts.can_view(profiles.uid(), p.id);
+$$;
+
 
 -- Trigger functions
 
@@ -767,3 +781,5 @@ GRANT EXECUTE ON FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stag
 GRANT EXECUTE ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
+REVOKE ALL ON FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) TO "anon", "authenticated", "service_role";

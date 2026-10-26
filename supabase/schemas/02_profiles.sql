@@ -314,7 +314,10 @@ CREATE OR REPLACE TRIGGER "profiles_scrub_identity_email" BEFORE INSERT OR UPDAT
 
 ALTER TABLE "profiles"."profiles" ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "SELECT for EVERYONE" ON "profiles"."profiles" FOR SELECT USING (true);
+-- Profiles are private: only the owner and moderator+ read them. The one public part,
+-- the usernames of script authors, goes through scripts.get_authors.
+CREATE POLICY "SELECT for OWNER and MODERATOR" ON "profiles"."profiles" FOR SELECT TO "authenticated"
+    USING ((("id" = ( SELECT "auth"."uid"() AS "uid")) OR "profiles"."min_role"(( SELECT "auth"."uid"() AS "uid"), 'moderator'::"profiles"."roles")));
 
 CREATE POLICY "UPDATE for OWNER" ON "profiles"."profiles" FOR UPDATE TO "authenticated"
     USING (("id" = ( SELECT "auth"."uid"() AS "uid")))
@@ -330,7 +333,7 @@ GRANT USAGE ON SCHEMA "profiles" TO "authenticated";
 GRANT USAGE ON SCHEMA "profiles" TO "service_role";
 
 REVOKE ALL ON TABLE "profiles"."profiles" FROM "anon", "authenticated";
-GRANT SELECT ON TABLE "profiles"."profiles" TO "anon", "authenticated";
+GRANT SELECT ON TABLE "profiles"."profiles" TO "authenticated";
 -- avatar always mirrors the provider (refresh_avatar), so clients only edit the username
 GRANT UPDATE ("username") ON TABLE "profiles"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "profiles"."profiles" TO "service_role";
@@ -358,7 +361,7 @@ GRANT EXECUTE ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_ro
 GRANT EXECUTE ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") TO "authenticated", "service_role";
 -- Anonymous visitors need these because RLS policies on other schemas call them
--- (they only expose what the public profiles SELECT policy already shows).
+-- (anyone who knows a user ID can learn that user's role through them).
 GRANT EXECUTE ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."uid"() TO "anon", "authenticated", "service_role";
