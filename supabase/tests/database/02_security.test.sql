@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(26);
+SELECT plan(30);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -43,7 +43,13 @@ SET LOCAL ROLE anon;
 SELECT is((SELECT count(*)::int FROM scripts.scripts), 1, 'anon sees the published script only');
 SELECT is((SELECT count(*)::int FROM scripts.versions), 0, 'anon cannot read versions');
 SELECT throws_ok($$SELECT * FROM payments.accounts$$, '42501', NULL, 'anon has no access to payments');
+SELECT throws_ok($$SELECT profiles.min_role('00000000-0000-0000-0000-000000000001', 'moderator')$$, '42501', NULL, 'anon cannot probe roles');
+SELECT throws_ok($$SELECT scripts.can_access('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001')$$, '42501', NULL, 'anon cannot call can_access');
 RESET ROLE;
+SET LOCAL ROLE authenticated;
+SELECT throws_ok($$SELECT scripts.can_access('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001')$$, '42501', NULL, 'signed-in users cannot call can_access');
+RESET ROLE;
+SELECT is((SELECT count(*)::int FROM pg_policies WHERE schemaname = 'storage' AND cmd = 'SELECT' AND policyname IN ('assets SELECT for everyone', 'client SELECT for everyone', 'imgs SELECT for everyone')), 0, 'public buckets cannot be listed');
 
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');

@@ -688,7 +688,7 @@ CREATE POLICY "SELECT for ALLOWED" ON "scripts"."protected" FOR SELECT USING ("s
 
 -- File lists are internal: the API delivers the files. Regular users read the
 -- live revision number from protected.revision.
-CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT
+CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT TO "authenticated"
     USING ("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"));
 
 CREATE POLICY "SELECT for EVERYONE" ON "scripts"."bundles" FOR SELECT USING (true);
@@ -780,7 +780,8 @@ GRANT EXECUTE ON FUNCTION "scripts"."is_premium"("script_id" "uuid") TO "anon", 
 GRANT EXECUTE ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."min_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon", "authenticated", "service_role";
-GRANT EXECUTE ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
+REVOKE ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
 REVOKE ALL ON FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) FROM PUBLIC, "anon", "authenticated";

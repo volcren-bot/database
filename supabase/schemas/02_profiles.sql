@@ -450,10 +450,11 @@ GRANT EXECUTE ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid"
 GRANT EXECUTE ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") TO "authenticated", "service_role";
--- Anonymous visitors need these because RLS policies on other schemas call them
--- (anyone who knows a user ID can learn that user's role through them).
-GRANT EXECUTE ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon", "authenticated", "service_role";
-GRANT EXECUTE ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon", "authenticated", "service_role";
+-- Only policies TO authenticated call these (anyone who could execute them could learn a user's role from an ID).
+REVOKE ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC, "anon";
+REVOKE ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "authenticated", "service_role";
+GRANT EXECUTE ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."uid"() TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_roles_enum"() TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."is_role"("target_role" "profiles"."roles") TO "anon", "authenticated", "service_role";

@@ -4,9 +4,9 @@
 -- Buckets:
 --   scripts   <script id>/<9-digit revision>/<file>. Authors upload the listed files of the
 --             pending revision only. Clients can't read it except the author and moderator+.
---   imgs      scripts/<script id>/cover.webp and banner.webp, public read, author write.
---   assets    public read, service_role write.
---   client    public read, service_role write (loader releases).
+--   imgs      scripts/<script id>/cover.webp and banner.webp, public by URL, author write.
+--   assets    public by URL, service_role write.
+--   client    public by URL, service_role write (loader releases).
 
 CREATE POLICY "scripts DELETE for supabase_admin" ON "storage"."objects" FOR DELETE USING ((("bucket_id" = 'scripts'::"text") AND (CURRENT_USER = 'supabase_admin'::"name")));
 
@@ -20,17 +20,12 @@ CREATE POLICY "imgs INSERT for author" ON "storage"."objects" FOR INSERT TO "aut
 
 CREATE POLICY "imgs UPDATE for author" ON "storage"."objects" FOR UPDATE USING ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")))) WITH CHECK ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
 
-CREATE POLICY "imgs SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'imgs'::"text"));
-
 CREATE POLICY "assets INSERT for service_role" ON "storage"."objects" FOR INSERT TO "service_role" WITH CHECK (("bucket_id" = 'assets'::"text"));
 
 CREATE POLICY "assets UPDATE for service_role" ON "storage"."objects" FOR UPDATE TO "service_role" USING (("bucket_id" = 'assets'::"text")) WITH CHECK (("bucket_id" = 'assets'::"text"));
-
-CREATE POLICY "assets SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'assets'::"text"));
 
 CREATE POLICY "client INSERT for service_role" ON "storage"."objects" FOR INSERT TO "service_role" WITH CHECK (("bucket_id" = 'client'::"text"));
 
 CREATE POLICY "client UPDATE for service_role" ON "storage"."objects" FOR UPDATE TO "service_role" USING (("bucket_id" = 'client'::"text")) WITH CHECK (("bucket_id" = 'client'::"text"));
 
-CREATE POLICY "client SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'client'::"text"));
-
+-- Public buckets need no SELECT policy for object URLs; one would only let clients list every file.
