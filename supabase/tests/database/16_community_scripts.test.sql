@@ -214,7 +214,7 @@ SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-00
   '23514', 'every file needs its size', 'a community revision declares its file sizes');
 SELECT throws_ok($$INSERT INTO scripts.versions (id, files, sizes) VALUES ('10000000-0000-0000-0000-000000000020', ARRAY['main.luau'], ARRAY[101])$$,
   '23514', 'community storage limit reached', 'a revision over the cap is refused');
-SELECT lives_ok($$INSERT INTO scripts.versions (id, files, sizes) VALUES ('10000000-0000-0000-0000-000000000020', ARRAY['main.luau', 'lib.luau'], ARRAY[40, 40])$$,
+SELECT lives_ok($$INSERT INTO scripts.versions (id, files, sizes, entry) VALUES ('10000000-0000-0000-0000-000000000020', ARRAY['main.luau', 'lib.luau'], ARRAY[40, 40], 'main.luau')$$,
   'a revision within the cap is accepted');
 RESET ROLE;
 

@@ -145,12 +145,16 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "revision" integer NOT NULL,
     "files" "text"[] NOT NULL,
     "sizes" bigint[] DEFAULT '{}'::bigint[] NOT NULL,
+    "entry" "text" NOT NULL,
     "status" "scripts"."version_status" DEFAULT 'pending'::"scripts"."version_status" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "published_at" timestamp with time zone,
     CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
+    CONSTRAINT "versions_entry_check" CHECK ("entry" = ANY("files")),
     CONSTRAINT "versions_sizes_check" CHECK ((cardinality("sizes") = 0 OR cardinality("sizes") = cardinality("files")) AND 0 <= ALL("sizes"))
 );
+
+COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One of files. Left out on insert, it is the only file of a single-file revision (tr_versions_pre_insert); a revision with several files has to name it.';
 
 COMMENT ON COLUMN "scripts"."versions"."sizes" IS 'Byte size of each file in files, in the same order. Required for community authors, who are capped on storage; the real sizes are checked again when the revision goes live (publish_version).';
 
@@ -789,6 +793,13 @@ BEGIN
   NEW.status := 'pending';
   NEW.published_at := NULL;
 
+  -- A single file is the entry. With several, the uploader has to say which one.
+  IF NEW.entry IS NULL AND cardinality(NEW.files) = 1 THEN
+    NEW.entry := NEW.files[1];
+  ELSIF NEW.entry IS NULL THEN
+    RAISE EXCEPTION 'a revision with several files needs an entry file' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
   -- A community author declares every file's size, and the revision has to fit what is left of
   -- their storage. The declared sizes can lie: publish_version checks the real ones.
   IF scripts.author_is_community(NEW.id) THEN
@@ -1269,7 +1280,7 @@ GRANT SELECT ON TABLE "scripts"."scripts", "scripts"."metadata", "scripts"."prot
 GRANT INSERT ("title", "description", "content") ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT UPDATE ("title", "description", "content", "published") ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT UPDATE ("type", "categories", "stage", "price") ON TABLE "scripts"."metadata" TO "authenticated";
-GRANT INSERT ("id", "files", "sizes") ON TABLE "scripts"."versions" TO "authenticated";
+GRANT INSERT ("id", "files", "sizes", "entry") ON TABLE "scripts"."versions" TO "authenticated";
 GRANT DELETE ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT INSERT ("name", "scripts") ON TABLE "scripts"."bundles" TO "authenticated";
 GRANT UPDATE ("name", "scripts") ON TABLE "scripts"."bundles" TO "authenticated";

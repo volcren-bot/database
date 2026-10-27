@@ -44,7 +44,7 @@ SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000003', '00000000-000
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 9);
 
-CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[]);
+CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[], entry text);
 
 -- starting -------------------------------------------------------------------
 INSERT INTO s SELECT 'a', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');

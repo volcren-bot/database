@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(39);
+SELECT plan(43);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -34,7 +34,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'plain');
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 INSERT INTO scripts.scripts (id, title, description, content, published) VALUES ('10000000-0000-0000-0000-000000000001', 'Mining', 'd', 'c', true);
 UPDATE scripts.metadata SET stage = 'stable' WHERE id = '10000000-0000-0000-0000-000000000001';
-INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau', 'lib.luau']);
+INSERT INTO scripts.versions (id, files, entry) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau', 'lib.luau'], 'main.luau');
 
 -- revision allocation -------------------------------------------------------
 SELECT is((SELECT status::text FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001'), 'pending', 'a new revision is pending');
@@ -87,6 +87,14 @@ SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000001', '10000000-000
 -- price limits ---------------------------------------------------------------------
 SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 23 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
 SELECT lives_ok($$UPDATE scripts.metadata SET type = 'premium', price = 22 WHERE id = '10000000-0000-0000-0000-000000000002'$$, 'the maximum price is allowed');
+
+-- entry file -------------------------------------------------------------------------
+SELECT is((SELECT entry FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001' AND revision = 3), 'main.luau', 'a single file is the entry');
+UPDATE scripts.versions SET status = 'discarded' WHERE id = '10000000-0000-0000-0000-000000000001' AND status = 'pending';
+INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['bot.luau']);
+SELECT is((SELECT entry FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001' AND files = ARRAY['bot.luau']), 'bot.luau', 'the entry needs no particular name');
+SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['a.luau', 'b.luau'])$$, '22023', NULL, 'several files need an entry');
+SELECT throws_ok($$INSERT INTO scripts.versions (id, files, entry) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['a.luau', 'b.luau'], 'c.luau')$$, '23514', NULL, 'the entry has to be one of the files');
 
 -- revision file names -----------------------------------------------------------------
 SELECT is(scripts.valid_files(ARRAY['main.luau', 'lib/util.luau', 'a_b-c..d', '.config']), true, 'plain names and subfolders are valid');

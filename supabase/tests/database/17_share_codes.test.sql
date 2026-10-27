@@ -224,7 +224,7 @@ RESET ROLE;
 UPDATE scripts.scripts SET published = true WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000004');
 SELECT set_config('request.jwt.claims', '{"role":"service_role"}', true);
-CREATE TEMP TABLE s (id uuid, revision int, files text[]);
+CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 SELECT is((SELECT price FROM payments.sessions WHERE id = (SELECT id FROM s)), 0::bigint, 'a grantee runs a premium script at price 0 without credits');
 SELECT throws_ok($$SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'while someone without a grant or credits cannot');

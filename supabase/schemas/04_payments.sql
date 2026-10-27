@@ -369,7 +369,7 @@ $$;
 -- the price for the whole session, so later price changes only apply to new
 -- sessions, and returns the live revision and its files for the API to hand out
 -- as signed URLs.
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[])
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -380,6 +380,7 @@ DECLARE
   v_listed_price bigint;
   v_price bigint;
   v_files text[];
+  v_entry text;
   v_id uuid;
 BEGIN
   IF profiles.is_banned(p_user) THEN
@@ -395,7 +396,7 @@ BEGIN
   JOIN scripts.metadata m ON m.id = p.id
   WHERE p.id = p_script;
 
-  SELECT v.files INTO v_files FROM scripts.versions v
+  SELECT v.files, v.entry INTO v_files, v_entry FROM scripts.versions v
   WHERE v.id = p_script AND v.revision = v_revision AND v.status = 'live'::scripts.version_status;
 
   IF NOT FOUND THEN
@@ -416,7 +417,7 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry;
 END;
 $$;
 
