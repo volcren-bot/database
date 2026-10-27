@@ -386,7 +386,7 @@ BEGIN
     RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
   END IF;
 
-  IF NOT scripts.can_access(p_user, p_script) THEN
+  IF NOT scripts.can_access(p_user, p_script) OR scripts.author_is_banned(p_script) THEN
     RAISE EXCEPTION 'script not accessible' USING ERRCODE = 'insufficient_privilege';
   END IF;
 
@@ -403,7 +403,7 @@ BEGIN
   END IF;
 
   v_price := CASE
-    WHEN v_author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) THEN 0
+    WHEN v_author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) OR scripts.has_grant(p_user, p_script) THEN 0
     ELSE v_listed_price
   END;
 
@@ -474,6 +474,12 @@ BEGIN
   SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR UPDATE;
 
   IF NOT FOUND OR v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  -- A banned author's scripts stop for everyone, running sessions included
+  IF scripts.author_is_banned(v_session.script_id) THEN
+    PERFORM payments.end_session(p_session, 'stopped');
     RETURN false;
   END IF;
 

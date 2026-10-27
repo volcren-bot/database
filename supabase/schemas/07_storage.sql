@@ -3,7 +3,8 @@
 --
 -- Buckets:
 --   scripts   <script id>/<9-digit revision>/<file>. Authors upload the listed files of the
---             pending revision only. Clients can't read it except the author and moderator+.
+--             pending revision only. Clients can't read it except the author, moderator+ and, for
+--             community scripts, tester+.
 --   imgs      scripts/<script id>/cover.webp and banner.webp, public by URL, author write.
 --   assets    public by URL, service_role write.
 --   client    public by URL, service_role write (loader releases).
@@ -12,9 +13,10 @@ CREATE POLICY "scripts DELETE for supabase_admin" ON "storage"."objects" FOR DEL
 
 CREATE POLICY "scripts INSERT for author" ON "storage"."objects" FOR INSERT TO "authenticated" WITH CHECK ((("bucket_id" = 'scripts'::"text") AND "scripts"."can_upload"("name")));
 
--- No client reads the bucket except the author and moderator+ (they review every revision).
--- Everyone else gets the files through signed URLs from the API after payments.start_session.
-CREATE POLICY "scripts SELECT for author" ON "storage"."objects" FOR SELECT TO "authenticated" USING ((("bucket_id" = 'scripts'::"text") AND ("scripts"."is_object_author"("profiles"."uid"(), "name") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
+-- No client reads the bucket except the author and moderator+ (they review every revision), and
+-- tester+ for community scripts. Everyone else gets the files through signed URLs from the API after
+-- payments.start_session.
+CREATE POLICY "scripts SELECT for author" ON "storage"."objects" FOR SELECT TO "authenticated" USING ((("bucket_id" = 'scripts'::"text") AND ("scripts"."is_object_author"("profiles"."uid"(), "name") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR ("profiles"."min_role"("profiles"."uid"(), 'tester'::"profiles"."roles") AND "scripts"."is_reviewable"("scripts"."safe_uuid"("split_part"("name", '/', 1)))))));
 
 CREATE POLICY "imgs INSERT for author" ON "storage"."objects" FOR INSERT TO "authenticated" WITH CHECK ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
 

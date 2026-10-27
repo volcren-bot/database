@@ -364,6 +364,63 @@ BEGIN
 END;
 $$;
 
+-- Whether the user accepted the current scripter_tos and community_tos (info.acceptances). A kind
+-- nobody has published yet asks nothing of scripter+ (existing scripters keep working until a
+-- version appears), but community authors can't pass until both exist. Only answers for the caller
+-- or service_role.
+CREATE OR REPLACE FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT (auth.role() = 'service_role' OR user_id = auth.uid())
+    AND COALESCE((
+      SELECT NOT EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY['scripter_tos'::info.kind, 'community_tos'::info.kind]) k
+        CROSS JOIN LATERAL (SELECT max(d.version) AS version FROM info.documents d WHERE d.kind = k) l
+        WHERE CASE
+          WHEN l.version IS NULL THEN p.role < 'scripter'::profiles.roles
+          ELSE NOT EXISTS (
+            SELECT 1 FROM info.acceptances a
+            WHERE a.user_id = has_accepted_terms.user_id AND a.kind = k AND a.version = l.version
+          )
+        END
+      )
+      FROM profiles.profiles p
+      WHERE p.id = user_id
+    ), false);
+$$;
+
+-- Keeps scripts and the contributor role in line with a role change. A scripter+ publishes what they
+-- make, so a contributor promoted to scripter has their scripts unpublished until they publish them
+-- again (grants keep working). Below scripter their scripts are community scripts, which are never
+-- premium, so a demotion makes them free. A scripter demoted straight to user who still authors
+-- scripts lands on contributor.
+CREATE OR REPLACE FUNCTION "profiles"."tr_profiles_role_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF OLD.role < 'scripter'::profiles.roles AND NEW.role >= 'scripter'::profiles.roles THEN
+    UPDATE scripts.scripts s SET published = false
+    FROM scripts.protected p
+    WHERE p.id = s.id AND p.author = NEW.id AND s.published;
+  ELSIF OLD.role >= 'scripter'::profiles.roles AND NEW.role < 'scripter'::profiles.roles THEN
+    UPDATE scripts.metadata m SET type = 'free'::scripts.type, price = 0
+    FROM scripts.protected p
+    WHERE p.id = m.id AND p.author = NEW.id AND (m.type <> 'free'::scripts.type OR m.price <> 0);
+
+    IF NEW.role = 'user'::profiles.roles AND EXISTS (SELECT 1 FROM scripts.protected p WHERE p.author = NEW.id) THEN
+      NEW.role := 'contributor'::profiles.roles;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION "profiles"."tr_impersonations_immutable"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -376,6 +433,8 @@ $$;
 CREATE OR REPLACE TRIGGER "tr_impersonations_immutable" BEFORE UPDATE OR DELETE ON "profiles"."impersonations" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
 
 CREATE OR REPLACE TRIGGER "tr_impersonations_truncate" BEFORE TRUNCATE ON "profiles"."impersonations" FOR EACH STATEMENT EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+CREATE OR REPLACE TRIGGER "tr_profiles_role_change" BEFORE UPDATE OF "role" ON "profiles"."profiles" FOR EACH ROW WHEN (OLD."role" IS DISTINCT FROM NEW."role") EXECUTE FUNCTION "profiles"."tr_profiles_role_change"();
 
 -- The ban record reuses the impersonations guard (its message names the table)
 CREATE OR REPLACE TRIGGER "tr_bans_immutable" BEFORE UPDATE OR DELETE ON "profiles"."bans" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
@@ -443,6 +502,10 @@ REVOKE ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user"
 REVOKE ALL ON FUNCTION "profiles"."tr_impersonations_immutable"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "profiles"."tr_profiles_role_change"() FROM PUBLIC, "anon", "authenticated";
+-- Called by policies on scripts and the scripts bucket (TO authenticated)
+REVOKE ALL ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."is_banned"("user_id" "uuid") TO "service_role";
