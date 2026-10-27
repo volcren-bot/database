@@ -33,6 +33,7 @@ INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000
 INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-0000-0000-0000-000000000002', 'Draft', 'd', 'c');
 -- give the first script a live revision
 INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/main.luau');
+INSERT INTO scripts.version_keys (id, revision, key) VALUES ('10000000-0000-0000-0000-000000000001', 1, decode(repeat('ab', 32), 'hex'));
 SET LOCAL ROLE authenticated;
 SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1);
 RESET ROLE;

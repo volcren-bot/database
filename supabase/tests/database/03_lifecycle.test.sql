@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(43);
+SELECT plan(51);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -56,9 +56,17 @@ SELECT throws_ok($$INSERT INTO storage.objects (bucket_id, name) VALUES ('script
 
 -- publishing -------------------------------------------------------------------
 SELECT throws_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, '42501', 'not allowed', 'another scripter cannot publish');
+SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, '42501', 'not allowed', 'nor set its key');
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_like($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, '%lib.luau%', 'publishing with a missing file fails and names it');
 INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/lib.luau');
+SELECT throws_like($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, '%no encryption key%', 'a revision with no key cannot go live');
+SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, 'abcd')$$, '22023', NULL, 'a key has to be 64 hex digits');
+SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('AB', 32))$$, '22023', NULL, 'in lowercase');
+SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 9, repeat('ab', 32))$$, 'P0001', NULL, 'and belong to a pending revision');
+SELECT throws_ok($$SELECT key FROM scripts.version_keys$$, '42501', NULL, 'clients cannot read keys');
+SELECT lives_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, 'the author sets the key');
+SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('cd', 32))$$, '23505', NULL, 'once');
 SELECT lives_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, 'publishing after all uploads succeeds');
 RESET ROLE;
 

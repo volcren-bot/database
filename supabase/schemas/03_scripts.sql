@@ -158,6 +158,16 @@ COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One
 
 COMMENT ON COLUMN "scripts"."versions"."sizes" IS 'Byte size of each file in files, in the same order. Required for community authors, who are capped on storage; the real sizes are checked again when the revision goes live (publish_version).';
 
+-- The AES-256 key that encrypts the files of one revision (see set_version_key). Only service_role reads it:
+-- the API hands it to the loader when a session starts, so the files in the scripts bucket are useless without one.
+CREATE TABLE IF NOT EXISTS "scripts"."version_keys" (
+    "id" "uuid" NOT NULL,
+    "revision" integer NOT NULL,
+    "key" "bytea" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "version_keys_key_check" CHECK (octet_length("key") = 32)
+);
+
 
 CREATE TABLE IF NOT EXISTS "scripts"."bundles" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
@@ -264,6 +274,12 @@ ALTER TABLE ONLY "scripts"."versions"
 
 ALTER TABLE ONLY "scripts"."bundles"
     ADD CONSTRAINT "bundles_pkey" PRIMARY KEY ("id");
+
+ALTER TABLE ONLY "scripts"."version_keys"
+    ADD CONSTRAINT "version_keys_pkey" PRIMARY KEY ("id", "revision");
+
+ALTER TABLE ONLY "scripts"."version_keys"
+    ADD CONSTRAINT "version_keys_version_fkey" FOREIGN KEY ("id", "revision") REFERENCES "scripts"."versions"("id", "revision") ON UPDATE CASCADE ON DELETE CASCADE;
 
 ALTER TABLE ONLY "scripts"."metadata"
     ADD CONSTRAINT "metadata_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON UPDATE CASCADE ON DELETE CASCADE;
@@ -897,6 +913,11 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- Every revision is stored encrypted (set_version_key)
+  IF NOT EXISTS (SELECT 1 FROM scripts.version_keys k WHERE k.id = script_id AND k.revision = publish_version.revision) THEN
+    RAISE EXCEPTION 'revision % of script % has no encryption key', revision, script_id;
+  END IF;
+
   -- The real sizes of a community author's files have to fit their storage, whatever was declared
   IF scripts.author_is_community(script_id) THEN
     SELECT p.author INTO v_author FROM scripts.protected p WHERE p.id = script_id;
@@ -913,6 +934,37 @@ BEGIN
 
   UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now()
   WHERE p.id = script_id;
+END;
+$$;
+
+-- Stores the key a pending revision's files were encrypted with, given as 64 hex digits. The encrypted file is
+-- nonce (12 bytes) || AES-256-GCM ciphertext and tag, authenticated with "volcren:<script id>/<9-digit revision>/<file>",
+-- so it is 28 bytes larger than the plain file and only opens under its own name. The key is set once, before the
+-- revision goes live. Same callers as publish_version.
+CREATE OR REPLACE FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
+    scripts.is_author(auth.uid(), script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
+  ) OR NOT profiles.has_accepted_terms(auth.uid())) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF key !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'the key must be 64 lowercase hex digits' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM scripts.versions v
+    WHERE v.id = script_id AND v.revision = set_version_key.revision AND v.status = 'pending'::scripts.version_status
+  ) THEN
+    RAISE EXCEPTION 'no pending revision % of script %', revision, script_id;
+  END IF;
+
+  INSERT INTO scripts.version_keys (id, revision, key) VALUES (script_id, revision, decode(key, 'hex'));
 END;
 $$;
 
@@ -1301,6 +1353,13 @@ GRANT DELETE ON TABLE "scripts"."share_codes" TO "authenticated";
 GRANT SELECT ("script_id", "user_id", "granted_at") ON TABLE "scripts"."grants" TO "authenticated";
 GRANT DELETE ON TABLE "scripts"."grants" TO "authenticated";
 GRANT ALL ON TABLE "scripts"."config", "scripts"."share_codes", "scripts"."grants", "scripts"."redeem_attempts" TO "service_role";
+
+-- Encryption keys: no client can read or write them directly
+ALTER TABLE "scripts"."version_keys" ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE "scripts"."version_keys" FROM "anon", "authenticated";
+GRANT ALL ON TABLE "scripts"."version_keys" TO "service_role";
+REVOKE ALL ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") TO "authenticated", "service_role";
 
 -- Functions are executable by PUBLIC by default; lock down the privileged ones.
 -- The policy helpers stay callable by anon because RLS policies call them.

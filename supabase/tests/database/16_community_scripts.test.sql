@@ -231,6 +231,7 @@ RESET ROLE;
 INSERT INTO storage.objects (bucket_id, name, metadata) VALUES
   ('scripts', '10000000-0000-0000-0000-000000000020/000000001/main.luau', '{"size": 90}'),
   ('scripts', '10000000-0000-0000-0000-000000000020/000000001/lib.luau', '{"size": 10}');
+INSERT INTO scripts.version_keys (id, revision, key) VALUES ('10000000-0000-0000-0000-000000000020', 1, decode(repeat('ab', 32), 'hex')), ('10000000-0000-0000-0000-000000000021', 1, decode(repeat('ab', 32), 'hex'));
 SET LOCAL ROLE authenticated;
 SELECT lives_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000020', 1)$$, 'real sizes that fit let the revision go live');
 RESET ROLE;
@@ -248,6 +249,7 @@ SET LOCAL ROLE authenticated;
 SELECT lives_ok($$INSERT INTO scripts.versions (id, files) VALUES ('20000000-0000-0000-0000-000000000002', ARRAY['main.luau'])$$, 'a scripter declares no sizes');
 RESET ROLE;
 INSERT INTO storage.objects (bucket_id, name, metadata) VALUES ('scripts', '20000000-0000-0000-0000-000000000002/000000001/main.luau', '{"size": 9999999}');
+INSERT INTO scripts.version_keys (id, revision, key) VALUES ('20000000-0000-0000-0000-000000000002', 1, decode(repeat('ab', 32), 'hex'));
 SET LOCAL ROLE authenticated;
 SELECT lives_ok($$SELECT scripts.publish_version('20000000-0000-0000-0000-000000000002', 1)$$, 'or fit a cap');
 RESET ROLE;

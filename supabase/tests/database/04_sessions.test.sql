@@ -21,6 +21,7 @@ BEGIN
   UPDATE scripts.metadata SET stage = 'stable', type = CASE WHEN p_price > 0 THEN 'premium'::scripts.type ELSE 'free'::scripts.type END, price = p_price WHERE id = p_id;
   INSERT INTO scripts.versions (id, files) VALUES (p_id, ARRAY['main.luau']);
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_id || '/000000001/main.luau');
+  INSERT INTO scripts.version_keys (id, revision, key) VALUES (p_id, 1, decode(repeat('ab', 32), 'hex'));
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', p_author, 'role', 'authenticated')::text, true);
   SET LOCAL ROLE authenticated;
   PERFORM scripts.publish_version(p_id, 1);
