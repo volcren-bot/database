@@ -413,6 +413,30 @@ $$;
 ALTER FUNCTION "payments"."end_stale_sessions"() OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "payments"."end_user_sessions"("p_user" "uuid") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_id uuid;
+  v_count integer := 0;
+BEGIN
+  FOR v_id IN
+    SELECT id FROM payments.sessions WHERE user_id = p_user AND ended_at IS NULL
+  LOOP
+    PERFORM payments.end_session(v_id, 'stopped');
+    v_count := v_count + 1;
+  END LOOP;
+
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."end_user_sessions"("p_user" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "payments"."heartbeat_session"("p_session" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -566,6 +590,10 @@ DECLARE
   v_files text[];
   v_id uuid;
 BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
   IF NOT scripts.can_access(p_user, p_script) THEN
     RAISE EXCEPTION 'script not accessible' USING ERRCODE = 'insufficient_privilege';
   END IF;
@@ -662,6 +690,20 @@ $$;
 
 
 ALTER FUNCTION "payments"."tr_profiles_post_insert"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."tr_profiles_pre_delete"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  PERFORM payments.end_user_sessions(OLD.id);
+  RETURN OLD;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."tr_profiles_pre_delete"() OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."transfer_earnings"("p_amount" bigint) RETURNS bigint
@@ -798,6 +840,18 @@ $$;
 ALTER FUNCTION "profiles"."handle_new_user"() OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "profiles"."is_banned"("user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT EXISTS (SELECT 1 FROM profiles.profiles p WHERE p.id = user_id AND p.banned_at IS NOT NULL);
+$$;
+
+
+ALTER FUNCTION "profiles"."is_banned"("user_id" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "profiles"."is_role"("target_role" "profiles"."roles") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -930,6 +984,53 @@ $$;
 
 
 ALTER FUNCTION "profiles"."scrub_user_email"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF p_admin IS NULL OR NOT profiles.is_role(p_admin, 'administrator') THEN
+    RAISE EXCEPTION 'only administrators can ban' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_banned IS NULL THEN
+    RAISE EXCEPTION 'p_banned must not be null';
+  END IF;
+
+  IF p_reason IS NULL OR btrim(p_reason) = '' THEN
+    RAISE EXCEPTION 'a reason is required';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM profiles.profiles WHERE id = p_user) THEN
+    RAISE EXCEPTION 'user % not found', p_user USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF profiles.min_role(p_user, 'administrator') THEN
+    RAISE EXCEPTION 'administrators cannot be banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  UPDATE profiles.profiles SET banned_at = CASE WHEN p_banned THEN now() END
+  WHERE id = p_user AND (banned_at IS NOT NULL) <> p_banned;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  INSERT INTO profiles.bans (admin_id, user_id, banned, reason) VALUES (p_admin, p_user, p_banned, btrim(p_reason));
+
+  IF p_banned THEN
+    PERFORM payments.end_user_sessions(p_user);
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "profiles"."tr_impersonations_immutable"() RETURNS "trigger"
@@ -1259,7 +1360,7 @@ DECLARE
   v_version scripts.versions;
   v_file text;
 BEGIN
-  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR NOT (
+  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
     scripts.is_author(auth.uid(), script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
   )) THEN
     RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
@@ -1439,6 +1540,7 @@ BEGIN
   UPDATE scripts.deploy_tokens t SET last_used_at = now()
   WHERE t.script_id = p_script AND t.token_hash = p_token_hash
     AND (scripts.is_author(t.created_by, t.script_id) OR profiles.min_role(t.created_by, 'moderator'::profiles.roles))
+    AND NOT profiles.is_banned(t.created_by)
   RETURNING t.id INTO v_id;
 
   IF NOT FOUND THEN
@@ -1565,6 +1667,82 @@ $$;
 
 
 ALTER FUNCTION "stats"."online_per_script"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[] DEFAULT '{}'::bigint[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.sessions%ROWTYPE;
+  v_limits stats.limits%ROWTYPE;
+  v_custom stats.limits_custom%ROWTYPE;
+  v_runtime bigint;
+  v_n integer;
+  i integer;
+BEGIN
+  SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No session %', p_session USING errcode = 'P0002';
+  END IF;
+  IF v_session.ended_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Session % has ended', p_session USING errcode = '55000';
+  END IF;
+
+  p_custom := COALESCE(p_custom, '{}'::bigint[]);
+  IF p_minutes IS NULL OR p_minutes < 0 OR p_experience IS NULL OR p_experience < 0 OR p_gold IS NULL THEN
+    RAISE EXCEPTION 'Invalid report' USING errcode = '22023';
+  END IF;
+  IF p_experience = 0 AND p_gold = 0 AND NOT EXISTS (SELECT 1 FROM unnest(p_custom) c WHERE c <> 0) THEN
+    RAISE EXCEPTION 'Nothing was reported' USING errcode = '22023';
+  END IF;
+
+  -- Both bounds 0 means no limit is configured for that value
+  SELECT * INTO v_limits FROM stats.limits WHERE id = v_session.script_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No stats limits for script %', v_session.script_id USING errcode = 'P0002';
+  END IF;
+  IF NOT (v_limits.xp_min = 0 AND v_limits.xp_max = 0)
+     AND (p_experience < v_limits.xp_min * p_minutes OR p_experience > v_limits.xp_max * p_minutes) THEN
+    RAISE EXCEPTION 'Reported experience is outside the script''s approved limits' USING errcode = '23514';
+  END IF;
+  IF NOT (v_limits.gp_min = 0 AND v_limits.gp_max = 0)
+     AND (p_gold < v_limits.gp_min * p_minutes OR p_gold > v_limits.gp_max * p_minutes) THEN
+    RAISE EXCEPTION 'Reported gold is outside the script''s approved limits' USING errcode = '23514';
+  END IF;
+
+  SELECT * INTO v_custom FROM stats.limits_custom WHERE id = v_session.script_id;
+  v_n := COALESCE(cardinality(p_custom), 0);
+  IF v_n > COALESCE(cardinality(v_custom.trackers), 0) THEN
+    RAISE EXCEPTION 'More custom values than the script has trackers' USING errcode = '23514';
+  END IF;
+  FOR i IN 1..v_n LOOP
+    IF NOT (COALESCE(v_custom.minima[i], 0) = 0 AND COALESCE(v_custom.maxima[i], 0) = 0)
+       AND (p_custom[i] < COALESCE(v_custom.minima[i], 0) * p_minutes
+            OR p_custom[i] > COALESCE(v_custom.maxima[i], 0) * p_minutes) THEN
+      RAISE EXCEPTION 'Reported custom value % is outside the script''s approved limits', i USING errcode = '23514';
+    END IF;
+  END LOOP;
+
+  v_runtime := round(p_minutes * 60 * 1000);
+  PERFORM stats.increment_script_stats(v_session.script_id, p_experience, p_gold, v_runtime);
+  PERFORM stats.increment_user_stats(v_session.user_id, p_experience, p_gold, v_runtime);
+
+  IF v_n > 0 THEN
+    -- Element-wise add, growing the stored array to the number of trackers
+    UPDATE stats.values_custom vc
+    SET "values" = (
+      SELECT COALESCE(array_agg(COALESCE(vc."values"[g], 0) + COALESCE(p_custom[g], 0) ORDER BY g), '{}'::bigint[])
+      FROM generate_series(1, GREATEST(cardinality(vc."values"), v_n)) g
+    )
+    WHERE vc.id = v_session.script_id;
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) OWNER TO "supabase_admin";
 
 SET default_tablespace = '';
 
@@ -1744,6 +1922,31 @@ COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when t
 
 
 
+CREATE TABLE IF NOT EXISTS "profiles"."bans" (
+    "id" bigint NOT NULL,
+    "admin_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "banned" boolean NOT NULL,
+    "reason" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "bans_reason_check" CHECK ((("reason" = "btrim"("reason")) AND (("char_length"("reason") >= 1) AND ("char_length"("reason") <= 500))))
+);
+
+
+ALTER TABLE "profiles"."bans" OWNER TO "supabase_admin";
+
+
+ALTER TABLE "profiles"."bans" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "profiles"."bans_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
 CREATE TABLE IF NOT EXISTS "profiles"."impersonations" (
     "id" bigint NOT NULL,
     "admin_id" "uuid" NOT NULL,
@@ -1772,12 +1975,17 @@ CREATE TABLE IF NOT EXISTS "profiles"."profiles" (
     "avatar" "text" DEFAULT ''::"text" NOT NULL,
     "role" "profiles"."roles" DEFAULT 'user'::"profiles"."roles" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "banned_at" timestamp with time zone,
     CONSTRAINT "profiles_avatar_check" CHECK ((("avatar" = ''::"text") OR (("avatar" ~ '^https://'::"text") AND ("char_length"("avatar") <= 512)))),
     CONSTRAINT "profiles_username_check" CHECK ((("username" = "btrim"("username")) AND (("char_length"("username") >= 2) AND ("char_length"("username") <= 32)) AND ("username" !~ '[[:cntrl:]]'::"text")))
 );
 
 
 ALTER TABLE "profiles"."profiles" OWNER TO "supabase_admin";
+
+
+COMMENT ON COLUMN "profiles"."profiles"."banned_at" IS 'Set while the account is banned. Only profiles.set_banned writes it.';
+
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."bundles" (
@@ -2018,6 +2226,11 @@ ALTER TABLE ONLY "payments"."sessions"
 
 
 
+ALTER TABLE ONLY "profiles"."bans"
+    ADD CONSTRAINT "bans_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "profiles"."impersonations"
     ADD CONSTRAINT "impersonations_pkey" PRIMARY KEY ("id");
 
@@ -2184,6 +2397,14 @@ CREATE OR REPLACE TRIGGER "tr_payments_limit_pending" BEFORE INSERT ON "payments
 
 
 
+CREATE OR REPLACE TRIGGER "tr_bans_immutable" BEFORE DELETE OR UPDATE ON "profiles"."bans" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+
+
+CREATE OR REPLACE TRIGGER "tr_bans_truncate" BEFORE TRUNCATE ON "profiles"."bans" FOR EACH STATEMENT EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
+
+
+
 CREATE OR REPLACE TRIGGER "tr_impersonations_immutable" BEFORE DELETE OR UPDATE ON "profiles"."impersonations" FOR EACH ROW EXECUTE FUNCTION "profiles"."tr_impersonations_immutable"();
 
 
@@ -2193,6 +2414,10 @@ CREATE OR REPLACE TRIGGER "tr_impersonations_truncate" BEFORE TRUNCATE ON "profi
 
 
 CREATE OR REPLACE TRIGGER "tr_profiles_post_insert" AFTER INSERT ON "profiles"."profiles" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_profiles_post_insert"();
+
+
+
+CREATE OR REPLACE TRIGGER "tr_profiles_pre_delete" BEFORE DELETE ON "profiles"."profiles" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_profiles_pre_delete"();
 
 
 
@@ -2375,6 +2600,9 @@ CREATE POLICY "UPDATE for OWNER" ON "profiles"."profiles" FOR UPDATE TO "authent
 
 
 
+ALTER TABLE "profiles"."bans" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "profiles"."impersonations" ENABLE ROW LEVEL SECURITY;
 
 
@@ -2421,7 +2649,7 @@ CREATE POLICY "SELECT for AUTHOR" ON "scripts"."deploy_tokens" FOR SELECT TO "au
 
 
 
-CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT USING (("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
+CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT TO "authenticated" USING (("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
 
 
 
@@ -2595,6 +2823,10 @@ GRANT ALL ON FUNCTION "payments"."end_stale_sessions"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "payments"."end_user_sessions"("p_user" "uuid") FROM PUBLIC;
+
+
+
 REVOKE ALL ON FUNCTION "payments"."heartbeat_session"("p_session" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "payments"."heartbeat_session"("p_session" "uuid") TO "postgres";
 GRANT ALL ON FUNCTION "payments"."heartbeat_session"("p_session" "uuid") TO "service_role";
@@ -2645,6 +2877,10 @@ REVOKE ALL ON FUNCTION "payments"."tr_profiles_post_insert"() FROM PUBLIC;
 
 
 
+REVOKE ALL ON FUNCTION "payments"."tr_profiles_pre_delete"() FROM PUBLIC;
+
+
+
 REVOKE ALL ON FUNCTION "payments"."transfer_earnings"("p_amount" bigint) FROM PUBLIC;
 GRANT ALL ON FUNCTION "payments"."transfer_earnings"("p_amount" bigint) TO "authenticated";
 GRANT ALL ON FUNCTION "payments"."transfer_earnings"("p_amount" bigint) TO "service_role";
@@ -2684,13 +2920,18 @@ REVOKE ALL ON FUNCTION "profiles"."handle_new_user"() FROM PUBLIC;
 
 
 
+REVOKE ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "profiles"."is_role"("target_role" "profiles"."roles") TO "anon";
 GRANT ALL ON FUNCTION "profiles"."is_role"("target_role" "profiles"."roles") TO "authenticated";
 GRANT ALL ON FUNCTION "profiles"."is_role"("target_role" "profiles"."roles") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon";
+REVOKE ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "authenticated";
 GRANT ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "service_role";
 
@@ -2701,7 +2942,7 @@ GRANT ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" 
 
 
 
-GRANT ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "anon";
+REVOKE ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "authenticated";
 GRANT ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "service_role";
 
@@ -2721,6 +2962,11 @@ REVOKE ALL ON FUNCTION "profiles"."scrub_identity_email"() FROM PUBLIC;
 
 
 REVOKE ALL ON FUNCTION "profiles"."scrub_user_email"() FROM PUBLIC;
+
+
+
+REVOKE ALL ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") TO "service_role";
 
 
 
@@ -2752,8 +2998,7 @@ GRANT ALL ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "service_rol
 
 
 
-GRANT ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "authenticated";
+REVOKE ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "service_role";
 
 
@@ -2905,6 +3150,11 @@ GRANT ALL ON FUNCTION "stats"."online_per_script"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) TO "service_role";
+
+
+
 GRANT SELECT ON TABLE "info"."documents" TO "anon";
 GRANT SELECT ON TABLE "info"."documents" TO "authenticated";
 GRANT ALL ON TABLE "info"."documents" TO "service_role";
@@ -2946,6 +3196,10 @@ GRANT ALL ON TABLE "payments"."payments" TO "service_role";
 GRANT SELECT ON TABLE "payments"."sessions" TO "authenticated";
 GRANT ALL ON TABLE "payments"."sessions" TO "postgres";
 GRANT SELECT ON TABLE "payments"."sessions" TO "service_role";
+
+
+
+GRANT SELECT ON TABLE "profiles"."bans" TO "service_role";
 
 
 
@@ -3182,8 +3436,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 
 CREATE POLICY "assets INSERT for service_role" ON "storage"."objects" FOR INSERT TO "service_role" WITH CHECK (("bucket_id" = 'assets'::"text"));
 
-CREATE POLICY "assets SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'assets'::"text"));
-
 CREATE POLICY "assets UPDATE for service_role" ON "storage"."objects" FOR UPDATE TO "service_role" USING (("bucket_id" = 'assets'::"text")) WITH CHECK (("bucket_id" = 'assets'::"text"));
 
 ALTER TABLE "storage"."buckets" ENABLE ROW LEVEL SECURITY;
@@ -3192,21 +3444,17 @@ ALTER TABLE "storage"."buckets_analytics" ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE "storage"."buckets_vectors" ENABLE ROW LEVEL SECURITY;
 
+CREATE POLICY "client INSERT for service_role" ON "storage"."objects" FOR INSERT TO "service_role" WITH CHECK (("bucket_id" = 'client'::"text"));
+
+CREATE POLICY "client UPDATE for service_role" ON "storage"."objects" FOR UPDATE TO "service_role" USING (("bucket_id" = 'client'::"text")) WITH CHECK (("bucket_id" = 'client'::"text"));
+
 ALTER TABLE "storage"."iceberg_namespaces" ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE "storage"."iceberg_tables" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "imgs INSERT for author" ON "storage"."objects" FOR INSERT TO "authenticated" WITH CHECK ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
 
-CREATE POLICY "imgs SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'imgs'::"text"));
-
 CREATE POLICY "imgs UPDATE for author" ON "storage"."objects" FOR UPDATE USING ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")))) WITH CHECK ((("bucket_id" = 'imgs'::"text") AND ((("array_length"("storage"."foldername"("name"), 1) = 2) AND (("storage"."foldername"("name"))[1] = 'scripts'::"text") AND ("storage"."filename"("name") = ANY (ARRAY['cover.webp'::"text", 'banner.webp'::"text"])) AND "scripts"."is_author"("profiles"."uid"(), "scripts"."safe_uuid"(("storage"."foldername"("name"))[2]))) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
-
-CREATE POLICY "launcher INSERT for service_role" ON "storage"."objects" FOR INSERT TO "service_role" WITH CHECK (("bucket_id" = 'launcher'::"text"));
-
-CREATE POLICY "launcher SELECT for everyone" ON "storage"."objects" FOR SELECT USING (("bucket_id" = 'launcher'::"text"));
-
-CREATE POLICY "launcher UPDATE for service_role" ON "storage"."objects" FOR UPDATE TO "service_role" USING (("bucket_id" = 'launcher'::"text")) WITH CHECK (("bucket_id" = 'launcher'::"text"));
 
 ALTER TABLE "storage"."migrations" ENABLE ROW LEVEL SECURITY;
 
