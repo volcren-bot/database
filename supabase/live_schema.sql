@@ -59,7 +59,8 @@ ALTER SCHEMA "stats" OWNER TO "postgres";
 CREATE TYPE "info"."kind" AS ENUM (
     'privacy_policy',
     'user_tos',
-    'scripter_tos'
+    'scripter_tos',
+    'community_tos'
 );
 
 
@@ -213,6 +214,33 @@ ALTER TYPE "scripts"."version_status" OWNER TO "supabase_admin";
 
 COMMENT ON TYPE "scripts"."version_status" IS 'Revision lifecycle';
 
+
+
+CREATE OR REPLACE FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_kind NOT IN ('scripter_tos'::info.kind, 'community_tos'::info.kind) THEN
+    RAISE EXCEPTION 'only the scripter and community terms are accepted' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF p_version IS DISTINCT FROM (SELECT max(d.version) FROM info.documents d WHERE d.kind = p_kind) THEN
+    RAISE EXCEPTION 'only the current version can be accepted' USING ERRCODE = 'check_violation';
+  END IF;
+
+  INSERT INTO info.acceptances (user_id, kind, version) VALUES (auth.uid(), p_kind, p_version)
+  ON CONFLICT DO NOTHING;
+END;
+$$;
+
+
+ALTER FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "info"."tr_documents_pre_insert"() RETURNS "trigger"
@@ -453,6 +481,12 @@ BEGIN
     RETURN false;
   END IF;
 
+  -- A banned author's scripts stop for everyone, running sessions included
+  IF scripts.author_is_banned(v_session.script_id) THEN
+    PERFORM payments.end_session(p_session, 'stopped');
+    RETURN false;
+  END IF;
+
   UPDATE payments.sessions SET last_seen = now() WHERE id = p_session;
 
   v_minutes := floor(extract(epoch FROM (now() - v_session.charged_until)) / 60)::integer;
@@ -577,7 +611,7 @@ $$;
 ALTER FUNCTION "payments"."settle_payment"("p_payment" "uuid") OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[])
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -588,13 +622,14 @@ DECLARE
   v_listed_price bigint;
   v_price bigint;
   v_files text[];
+  v_entry text;
   v_id uuid;
 BEGIN
   IF profiles.is_banned(p_user) THEN
     RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
   END IF;
 
-  IF NOT scripts.can_access(p_user, p_script) THEN
+  IF NOT scripts.can_access(p_user, p_script) OR scripts.author_is_banned(p_script) THEN
     RAISE EXCEPTION 'script not accessible' USING ERRCODE = 'insufficient_privilege';
   END IF;
 
@@ -603,7 +638,7 @@ BEGIN
   JOIN scripts.metadata m ON m.id = p.id
   WHERE p.id = p_script;
 
-  SELECT v.files INTO v_files FROM scripts.versions v
+  SELECT v.files, v.entry INTO v_files, v_entry FROM scripts.versions v
   WHERE v.id = p_script AND v.revision = v_revision AND v.status = 'live'::scripts.version_status;
 
   IF NOT FOUND THEN
@@ -611,7 +646,7 @@ BEGIN
   END IF;
 
   v_price := CASE
-    WHEN v_author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) THEN 0
+    WHEN v_author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) OR scripts.has_grant(p_user, p_script) THEN 0
     ELSE v_listed_price
   END;
 
@@ -624,7 +659,7 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry;
 END;
 $$;
 
@@ -840,6 +875,34 @@ $$;
 ALTER FUNCTION "profiles"."handle_new_user"() OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT (auth.role() = 'service_role' OR user_id = auth.uid())
+    AND COALESCE((
+      SELECT NOT EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY['scripter_tos'::info.kind, 'community_tos'::info.kind]) k
+        CROSS JOIN LATERAL (SELECT max(d.version) AS version FROM info.documents d WHERE d.kind = k) l
+        WHERE CASE
+          WHEN l.version IS NULL THEN p.role < 'scripter'::profiles.roles
+          ELSE NOT EXISTS (
+            SELECT 1 FROM info.acceptances a
+            WHERE a.user_id = has_accepted_terms.user_id AND a.kind = k AND a.version = l.version
+          )
+        END
+      )
+      FROM profiles.profiles p
+      WHERE p.id = user_id
+    ), false);
+$$;
+
+
+ALTER FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "profiles"."is_banned"("user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -1046,6 +1109,34 @@ $$;
 ALTER FUNCTION "profiles"."tr_impersonations_immutable"() OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "profiles"."tr_profiles_role_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF OLD.role < 'scripter'::profiles.roles AND NEW.role >= 'scripter'::profiles.roles THEN
+    UPDATE scripts.scripts s SET published = false
+    FROM scripts.protected p
+    WHERE p.id = s.id AND p.author = NEW.id AND s.published;
+  ELSIF OLD.role >= 'scripter'::profiles.roles AND NEW.role < 'scripter'::profiles.roles THEN
+    UPDATE scripts.metadata m SET type = 'free'::scripts.type, price = 0
+    FROM scripts.protected p
+    WHERE p.id = m.id AND p.author = NEW.id AND (m.type <> 'free'::scripts.type OR m.price <> 0);
+
+    IF NEW.role = 'user'::profiles.roles AND EXISTS (SELECT 1 FROM scripts.protected p WHERE p.author = NEW.id) THEN
+      NEW.role := 'contributor'::profiles.roles;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."tr_profiles_role_change"() OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "profiles"."uid"() RETURNS "uuid"
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -1114,6 +1205,69 @@ $$;
 
 ALTER FUNCTION "public"."webhook"() OWNER TO "supabase_admin";
 
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "scripts"."scripts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "url" "text" DEFAULT ("gen_random_uuid"())::"text" NOT NULL,
+    "title" "text" NOT NULL,
+    "description" "text" NOT NULL,
+    "content" "text" NOT NULL,
+    "published" boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE "scripts"."scripts" OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT profiles.min_role(auth.uid(), 'moderator'::profiles.roles) AND scripts.author_is_banned(s.id);
+$$;
+
+
+ALTER FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."author_is_banned"("script_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT COALESCE((
+    SELECT a.banned_at IS NOT NULL
+    FROM scripts.protected p
+    JOIN profiles.profiles a ON a.id = p.author
+    WHERE p.id = script_id
+  ), false);
+$$;
+
+
+ALTER FUNCTION "scripts"."author_is_banned"("script_id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."author_is_community"("script_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT COALESCE((
+    SELECT a.role < 'scripter'::profiles.roles
+    FROM scripts.protected p
+    JOIN profiles.profiles a ON a.id = p.author
+    WHERE p.id = script_id
+  ), false);
+$$;
+
+
+ALTER FUNCTION "scripts"."author_is_community"("script_id" "uuid") OWNER TO "supabase_admin";
+
 
 CREATE OR REPLACE FUNCTION "scripts"."can_access"("script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE
@@ -1135,10 +1289,13 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_
               SELECT role FROM profiles.profiles WHERE id = accesser_id
       ),
       script AS (
-              SELECT p.author, p.revision, m.type, m.stage, m.price, s.published
+              SELECT p.author, p.revision, m.type, m.stage, m.price, s.published,
+                     a.role AS author_role, a.banned_at IS NOT NULL AS author_banned,
+                     EXISTS (SELECT 1 FROM scripts.grants g WHERE g.script_id = s.id AND g.user_id = accesser_id) AS granted
               FROM scripts.scripts s
               JOIN scripts.metadata m ON m.id = s.id
               JOIN scripts.protected p ON p.id = s.id
+              JOIN profiles.profiles a ON a.id = p.author
               WHERE s.id = script_id
       )
       SELECT
@@ -1146,21 +1303,28 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_
               AND COALESCE((
                       SELECT
                               sc.revision > 0
+                              AND (NOT sc.author_banned OR COALESCE(v.role >= 'moderator'::profiles.roles, false))
                               AND (
                               sc.author = accesser_id
                               OR v.role >= 'moderator'::profiles.roles
+                              OR sc.granted
                               OR (
-                                      CASE sc.stage
-                                              WHEN 'alpha'::scripts.stage THEN v.role >= 'tester'::profiles.roles
-                                              WHEN 'beta'::scripts.stage THEN sc.published
-                                              WHEN 'stable'::scripts.stage THEN sc.published
-                                              ELSE false
+                                      CASE
+                                              WHEN sc.author_role < 'scripter'::profiles.roles THEN v.role >= 'tester'::profiles.roles
+                                              ELSE (
+                                                      CASE sc.stage
+                                                              WHEN 'alpha'::scripts.stage THEN v.role >= 'tester'::profiles.roles
+                                                              WHEN 'beta'::scripts.stage THEN sc.published
+                                                              WHEN 'stable'::scripts.stage THEN sc.published
+                                                              ELSE false
+                                                      END
+                                                      AND (
+                                                              sc.type <> 'premium'::scripts.type
+                                                              OR v.role >= 'tester'::profiles.roles
+                                                              OR COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = accesser_id), 0) >= payments.required_balance(sc.price)
+                                                      )
+                                              )
                                       END
-                                      AND (
-                                              sc.type <> 'premium'::scripts.type
-                                              OR v.role >= 'tester'::profiles.roles
-                                              OR COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = accesser_id), 0) >= payments.required_balance(sc.price)
-                                      )
                               )
                               )
                       FROM script sc
@@ -1170,6 +1334,20 @@ $$;
 
 
 ALTER FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."can_create_script"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT auth.uid() IS NOT NULL
+    AND profiles.has_accepted_terms(auth.uid())
+    AND (profiles.min_role(auth.uid(), 'scripter'::profiles.roles) OR NOT profiles.is_banned(auth.uid()));
+$$;
+
+
+ALTER FUNCTION "scripts"."can_create_script"() OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."can_upload"("object_name" "text") RETURNS boolean
@@ -1188,6 +1366,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_upload"("object_name" "text") RETURNS 
         scripts.is_author(auth.uid(), v.id)
         OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
       )
+      AND profiles.has_accepted_terms(auth.uid())
   );
 $$;
 
@@ -1202,20 +1381,25 @@ CREATE OR REPLACE FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" 
     AS $$
       SELECT COALESCE((
         SELECT
-          p.author = viewer_id
-          OR COALESCE(v.role >= 'moderator'::profiles.roles, false)
-          OR (
-            p.revision > 0
-            AND CASE m.stage
-                  WHEN 'archived'::scripts.stage THEN false
-                  WHEN 'prototype'::scripts.stage THEN false
-                  WHEN 'alpha'::scripts.stage THEN COALESCE(v.role >= 'tester'::profiles.roles, false)
-                  ELSE s.published
-                END
-          )
+          CASE
+            WHEN COALESCE(v.role >= 'moderator'::profiles.roles, false) THEN true
+            WHEN a.banned_at IS NOT NULL THEN false
+            WHEN p.author = viewer_id THEN true
+            WHEN EXISTS (SELECT 1 FROM scripts.grants g WHERE g.script_id = s.id AND g.user_id = viewer_id) THEN true
+            WHEN a.role < 'scripter'::profiles.roles THEN COALESCE(v.role >= 'tester'::profiles.roles, false)
+            ELSE
+              p.revision > 0
+              AND CASE m.stage
+                    WHEN 'archived'::scripts.stage THEN false
+                    WHEN 'prototype'::scripts.stage THEN false
+                    WHEN 'alpha'::scripts.stage THEN COALESCE(v.role >= 'tester'::profiles.roles, false)
+                    ELSE s.published
+                  END
+          END
         FROM scripts.scripts s
         LEFT JOIN scripts.protected p ON p.id = s.id
         LEFT JOIN scripts.metadata m ON m.id = s.id
+        LEFT JOIN profiles.profiles a ON a.id = p.author
         LEFT JOIN profiles.profiles v ON v.id = viewer_id
         WHERE s.id = script_id
       ), false);
@@ -1223,6 +1407,75 @@ $$;
 
 
 ALTER FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) RETURNS TABLE("id" "uuid", "code" "text", "expires_at" timestamp with time zone)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_cfg scripts.config;
+  v_code text;
+  v_id uuid;
+BEGIN
+  IF auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
+    scripts.is_author(auth.uid(), p_script) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
+  ) OR NOT profiles.has_accepted_terms(auth.uid()) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM scripts.scripts s WHERE s.id = p_script) THEN
+    RAISE EXCEPTION 'script % not found', p_script USING ERRCODE = 'no_data_found';
+  END IF;
+
+  SELECT * INTO v_cfg FROM scripts.config;
+
+  IF p_expires_at IS NULL OR p_expires_at <= now() OR p_expires_at > now() + make_interval(days => v_cfg.max_share_code_days) THEN
+    RAISE EXCEPTION 'a share code expires within % days from now', v_cfg.max_share_code_days USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Concurrent creations for one script queue here, so each counts the others' codes
+  PERFORM pg_advisory_xact_lock(hashtext('scripts.share_codes.' || p_script::text));
+
+  IF (SELECT count(*) FROM scripts.share_codes c WHERE c.script_id = p_script AND c.redeemed_at IS NULL AND c.expires_at > now()) >= v_cfg.max_open_share_codes THEN
+    RAISE EXCEPTION 'a script can have at most % open share codes', v_cfg.max_open_share_codes USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_code := encode(extensions.gen_random_bytes(32), 'hex');
+
+  INSERT INTO scripts.share_codes AS c (script_id, code_hash, expires_at)
+  VALUES (p_script, encode(extensions.digest(v_code, 'sha256'), 'hex'), p_expires_at)
+  RETURNING c.id INTO v_id;
+
+  RETURN QUERY SELECT v_id, v_code, p_expires_at;
+END;
+$$;
+
+
+ALTER FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."delete_expired_share_codes"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_count integer;
+BEGIN
+  DELETE FROM scripts.share_codes c WHERE c.redeemed_at IS NULL AND c.expires_at < now();
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  DELETE FROM scripts.redeem_attempts a
+  WHERE a.attempted_at < now() - make_interval(mins => (SELECT c.redeem_window_minutes FROM scripts.config c));
+
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "scripts"."delete_expired_share_codes"() OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."discard_version"("script_id" "uuid", "revision" integer) RETURNS "void"
@@ -1266,6 +1519,24 @@ $$;
 ALTER FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."get_community_usage"() RETURNS TABLE("script_count" integer, "used_bytes" bigint, "max_scripts" integer, "max_bytes" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT
+    (SELECT count(*)::integer FROM scripts.protected p WHERE p.author = auth.uid()),
+    scripts.storage_used(auth.uid()),
+    c.max_community_scripts,
+    c.max_community_bytes
+  FROM scripts.config c
+  WHERE auth.uid() IS NOT NULL;
+$$;
+
+
+ALTER FUNCTION "scripts"."get_community_usage"() OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."get_revision"("script_id" "uuid") RETURNS integer
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -1275,6 +1546,18 @@ $$;
 
 
 ALTER FUNCTION "scripts"."get_revision"("script_id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT EXISTS (SELECT 1 FROM scripts.grants g WHERE g.user_id = has_grant.user_id AND g.script_id = has_grant.script_id);
+$$;
+
+
+ALTER FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") RETURNS boolean
@@ -1288,6 +1571,29 @@ $$;
 
 
 ALTER FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."is_community"("s" "scripts"."scripts") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT scripts.author_is_community(s.id);
+$$;
+
+
+ALTER FUNCTION "scripts"."is_community"("s" "scripts"."scripts") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT COALESCE(scripts.has_grant(auth.uid(), s.id), false);
+$$;
+
+
+ALTER FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."is_object_author"("user_id" "uuid", "object_name" "text") RETURNS boolean
@@ -1318,6 +1624,18 @@ $$;
 ALTER FUNCTION "scripts"."is_premium"("script_id" "uuid") OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."is_reviewable"("script_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT scripts.author_is_community(script_id) AND NOT scripts.author_is_banned(script_id);
+$$;
+
+
+ALTER FUNCTION "scripts"."is_reviewable"("script_id" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -1327,6 +1645,23 @@ $$;
 
 
 ALTER FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."list_grantees"("p_script" "uuid") RETURNS TABLE("user_id" "uuid", "username" "text", "granted_at" timestamp with time zone)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT g.user_id, u.username, g.granted_at
+  FROM scripts.grants g
+  JOIN profiles.profiles u ON u.id = g.user_id
+  WHERE g.script_id = p_script
+    AND (scripts.is_author(auth.uid(), p_script) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles))
+  ORDER BY g.granted_at;
+$$;
+
+
+ALTER FUNCTION "scripts"."list_grantees"("p_script" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") RETURNS boolean
@@ -1359,10 +1694,11 @@ CREATE OR REPLACE FUNCTION "scripts"."publish_version"("script_id" "uuid", "revi
 DECLARE
   v_version scripts.versions;
   v_file text;
+  v_author uuid;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
     scripts.is_author(auth.uid(), script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
-  )) THEN
+  ) OR NOT profiles.has_accepted_terms(auth.uid())) THEN
     RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
   END IF;
 
@@ -1388,6 +1724,22 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- Every revision is stored encrypted (set_version_key)
+  IF NOT EXISTS (SELECT 1 FROM scripts.version_keys k WHERE k.id = script_id AND k.revision = publish_version.revision) THEN
+    RAISE EXCEPTION 'revision % of script % has no encryption key', revision, script_id;
+  END IF;
+
+  -- The real sizes of a community author's files have to fit their storage, whatever was declared
+  IF scripts.author_is_community(script_id) THEN
+    SELECT p.author INTO v_author FROM scripts.protected p WHERE p.id = script_id;
+
+    PERFORM pg_advisory_xact_lock(hashtext('scripts.storage.' || v_author::text));
+
+    IF scripts.storage_used(v_author, false) > (SELECT c.max_community_bytes FROM scripts.config c) THEN
+      RAISE EXCEPTION 'community storage limit reached' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
   UPDATE scripts.versions v SET status = 'live', published_at = now()
   WHERE v.id = script_id AND v.revision = publish_version.revision;
 
@@ -1398,6 +1750,86 @@ $$;
 
 
 ALTER FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."redeem_share_code"("p_code" "text") RETURNS TABLE("status" "text", "script_id" "uuid", "url" "text")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $_$
+DECLARE
+  v_user uuid := auth.uid();
+  v_cfg scripts.config;
+  v_code scripts.share_codes;
+  v_author uuid;
+  v_clean text := lower(btrim(COALESCE(p_code, '')));
+  v_status text;
+  v_url text;
+  v_rows integer;
+BEGIN
+  IF v_user IS NULL OR profiles.is_banned(v_user) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  SELECT * INTO v_cfg FROM scripts.config;
+
+  -- One redemption of an account at a time: the attempt count below can't be raced past
+  PERFORM pg_advisory_xact_lock(hashtext('scripts.redeem.' || v_user::text));
+
+  IF (SELECT count(*) FROM scripts.redeem_attempts a
+      WHERE a.user_id = v_user AND a.attempted_at > now() - make_interval(mins => v_cfg.redeem_window_minutes)) >= v_cfg.redeem_max_failures THEN
+    RETURN QUERY SELECT 'rate_limited'::text, NULL::uuid, NULL::text;
+    RETURN;
+  END IF;
+
+  IF v_clean !~ '^[0-9a-f]{64}$' THEN
+    v_status := 'invalid';
+  ELSE
+    SELECT * INTO v_code FROM scripts.share_codes c
+    WHERE c.code_hash = encode(extensions.digest(v_clean, 'sha256'), 'hex')
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+      v_status := 'invalid';
+    ELSE
+      SELECT p.author INTO v_author FROM scripts.protected p WHERE p.id = v_code.script_id;
+
+      IF profiles.is_banned(v_author) THEN
+        v_status := 'invalid';
+      ELSIF v_code.redeemed_at IS NOT NULL THEN
+        v_status := 'used';
+      ELSIF v_code.expires_at <= now() THEN
+        v_status := 'expired';
+      ELSIF v_author = v_user OR v_code.created_by = v_user THEN
+        v_status := 'own';
+      ELSIF scripts.can_view(v_user, v_code.script_id) THEN
+        v_status := 'already_access';
+      ELSE
+        INSERT INTO scripts.grants (script_id, user_id, code_id) VALUES (v_code.script_id, v_user, v_code.id)
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+
+        IF v_rows = 0 THEN
+          v_status := 'already_access';
+        ELSE
+          UPDATE scripts.share_codes c SET redeemed_by = v_user, redeemed_at = now() WHERE c.id = v_code.id;
+          SELECT s.url INTO v_url FROM scripts.scripts s WHERE s.id = v_code.script_id;
+          v_status := 'ok';
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+
+  IF v_status IN ('invalid', 'used', 'expired') THEN
+    INSERT INTO scripts.redeem_attempts (user_id) VALUES (v_user);
+  END IF;
+
+  RETURN QUERY SELECT v_status, CASE WHEN v_status = 'ok' THEN v_code.script_id END, v_url;
+END;
+$_$;
+
+
+ALTER FUNCTION "scripts"."redeem_share_code"("p_code" "text") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."safe_uuid"("value" "text") RETURNS "uuid"
@@ -1413,6 +1845,61 @@ $_$;
 ALTER FUNCTION "scripts"."safe_uuid"("value" "text") OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $_$
+BEGIN
+  IF auth.role() IS DISTINCT FROM 'service_role' AND (auth.uid() IS NULL OR profiles.is_banned(auth.uid()) OR NOT (
+    scripts.is_author(auth.uid(), script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
+  ) OR NOT profiles.has_accepted_terms(auth.uid())) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF key !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'the key must be 64 lowercase hex digits' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM scripts.versions v
+    WHERE v.id = script_id AND v.revision = set_version_key.revision AND v.status = 'pending'::scripts.version_status
+  ) THEN
+    RAISE EXCEPTION 'no pending revision % of script %', revision, script_id;
+  END IF;
+
+  INSERT INTO scripts.version_keys (id, revision, key) VALUES (script_id, revision, decode(key, 'hex'));
+END;
+$_$;
+
+
+ALTER FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean DEFAULT true) RETURNS bigint
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT COALESCE(sum(
+    CASE WHEN reserve_pending AND v.status = 'pending'::scripts.version_status THEN GREATEST(d.declared, r.stored) ELSE r.stored END
+  ), 0)::bigint
+  FROM scripts.protected p
+  JOIN scripts.versions v ON v.id = p.id
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(sum((o.metadata ->> 'size')::bigint), 0) AS stored
+    FROM storage.objects o
+    WHERE o.bucket_id = 'scripts'
+      AND o.name LIKE v.id::text || '/' || lpad(v.revision::text, 9, '0') || '/%'
+  ) r
+  CROSS JOIN LATERAL (SELECT COALESCE(sum(z), 0) AS declared FROM unnest(v.sizes) z) d
+  WHERE p.author = author_id;
+$$;
+
+
+ALTER FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean) OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."tr_metadata_pre_update"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -1425,6 +1912,10 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
+  IF (NEW.type <> 'free'::scripts.type OR NEW.price <> 0) AND scripts.author_is_community(NEW.id) THEN
+    RAISE EXCEPTION 'community scripts cannot be premium' USING ERRCODE = 'check_violation';
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -1433,11 +1924,32 @@ $$;
 ALTER FUNCTION "scripts"."tr_metadata_pre_update"() OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."tr_protected_post_delete"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM scripts.protected p WHERE p.author = OLD.author) THEN
+    UPDATE profiles.profiles p SET role = 'user'::profiles.roles
+    WHERE p.id = OLD.author AND p.role = 'contributor'::profiles.roles;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "scripts"."tr_protected_post_delete"() OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_post_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
     AS $$
+DECLARE
+  v_role profiles.roles;
 BEGIN
   INSERT INTO scripts.protected (id, author) VALUES (NEW.id, auth.uid());
   INSERT INTO scripts.metadata (id) VALUES (NEW.id);
@@ -1446,6 +1958,19 @@ BEGIN
   INSERT INTO stats.values (id) VALUES (NEW.id);
   INSERT INTO stats.values_custom (id) VALUES (NEW.id);
   INSERT INTO stats.website (id) VALUES (NEW.id);
+
+  SELECT p.role INTO v_role FROM profiles.profiles p WHERE p.id = auth.uid();
+
+  IF v_role < 'scripter'::profiles.roles THEN
+    -- Concurrent inserts of one author queue here, so each counts the others' scripts
+    PERFORM pg_advisory_xact_lock(hashtext('scripts.community.' || auth.uid()::text));
+
+    IF (SELECT count(*) FROM scripts.protected p WHERE p.author = auth.uid()) > (SELECT c.max_community_scripts FROM scripts.config c) THEN
+      RAISE EXCEPTION 'community script limit reached' USING ERRCODE = 'check_violation';
+    END IF;
+
+    UPDATE profiles.profiles p SET role = 'contributor'::profiles.roles WHERE p.id = auth.uid() AND p.role = 'user'::profiles.roles;
+  END IF;
 
   RETURN NEW;
 END;
@@ -1513,14 +2038,37 @@ CREATE OR REPLACE FUNCTION "scripts"."tr_versions_pre_insert"() RETURNS "trigger
     SET "search_path" TO ''
     SET "row_security" TO 'off'
     AS $$
+DECLARE
+  v_author uuid;
 BEGIN
   UPDATE scripts.protected
   SET last_revision = last_revision + 1
   WHERE id = NEW.id
-  RETURNING last_revision INTO NEW.revision;
+  RETURNING last_revision, author INTO NEW.revision, v_author;
 
   NEW.status := 'pending';
   NEW.published_at := NULL;
+
+  -- A single file is the entry. With several, the uploader has to say which one.
+  IF NEW.entry IS NULL AND cardinality(NEW.files) = 1 THEN
+    NEW.entry := NEW.files[1];
+  ELSIF NEW.entry IS NULL THEN
+    RAISE EXCEPTION 'a revision with several files needs an entry file' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  -- A community author declares every file's size, and the revision has to fit what is left of
+  -- their storage. The declared sizes can lie: publish_version checks the real ones.
+  IF scripts.author_is_community(NEW.id) THEN
+    IF cardinality(NEW.sizes) <> cardinality(NEW.files) THEN
+      RAISE EXCEPTION 'every file needs its size' USING ERRCODE = 'check_violation';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtext('scripts.storage.' || v_author::text));
+
+    IF scripts.storage_used(v_author) + (SELECT COALESCE(sum(z), 0) FROM unnest(NEW.sizes) z) > (SELECT c.max_community_bytes FROM scripts.config c) THEN
+      RAISE EXCEPTION 'community storage limit reached' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
 
   RETURN NEW;
 END;
@@ -1541,6 +2089,7 @@ BEGIN
   WHERE t.script_id = p_script AND t.token_hash = p_token_hash
     AND (scripts.is_author(t.created_by, t.script_id) OR profiles.min_role(t.created_by, 'moderator'::profiles.roles))
     AND NOT profiles.is_banned(t.created_by)
+    AND profiles.has_accepted_terms(t.created_by)
   RETURNING t.id INTO v_id;
 
   IF NOT FOUND THEN
@@ -1744,9 +2293,16 @@ $$;
 
 ALTER FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) OWNER TO "supabase_admin";
 
-SET default_tablespace = '';
 
-SET default_table_access_method = "heap";
+CREATE TABLE IF NOT EXISTS "info"."acceptances" (
+    "user_id" "uuid" NOT NULL,
+    "version" integer NOT NULL,
+    "accepted_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "kind" "info"."kind" NOT NULL
+);
+
+
+ALTER TABLE "info"."acceptances" OWNER TO "supabase_admin";
 
 
 CREATE TABLE IF NOT EXISTS "info"."documents" (
@@ -1999,6 +2555,42 @@ CREATE TABLE IF NOT EXISTS "scripts"."bundles" (
 ALTER TABLE "scripts"."bundles" OWNER TO "supabase_admin";
 
 
+CREATE TABLE IF NOT EXISTS "scripts"."config" (
+    "id" boolean DEFAULT true NOT NULL,
+    "max_community_scripts" integer DEFAULT 50 NOT NULL,
+    "max_community_bytes" bigint DEFAULT 31457280 NOT NULL,
+    "max_open_share_codes" integer DEFAULT 20 NOT NULL,
+    "max_share_code_days" integer DEFAULT 30 NOT NULL,
+    "redeem_max_failures" integer DEFAULT 10 NOT NULL,
+    "redeem_window_minutes" integer DEFAULT 60 NOT NULL,
+    CONSTRAINT "config_check" CHECK ((("max_community_scripts" > 0) AND ("max_community_bytes" > 0) AND ("max_open_share_codes" > 0) AND ("max_share_code_days" > 0) AND ("redeem_max_failures" > 0) AND ("redeem_window_minutes" > 0))),
+    CONSTRAINT "config_singleton" CHECK ("id")
+);
+
+
+ALTER TABLE "scripts"."config" OWNER TO "supabase_admin";
+
+
+COMMENT ON COLUMN "scripts"."config"."max_community_scripts" IS 'Scripts a community author (role below scripter) can have. Scripter+ has no limit.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."max_community_bytes" IS 'Bytes of stored script files (every revision, pending, live or old) a community author can have: 30 MiB.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."max_open_share_codes" IS 'Unredeemed, unexpired share codes a script can have at a time.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."max_share_code_days" IS 'The furthest a share code expiry can be set.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."redeem_max_failures" IS 'Failed share code redemptions an account gets per redeem_window_minutes before redeem_share_code stops answering.';
+
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."deploy_tokens" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "script_id" "uuid" NOT NULL,
@@ -2013,6 +2605,17 @@ CREATE TABLE IF NOT EXISTS "scripts"."deploy_tokens" (
 
 
 ALTER TABLE "scripts"."deploy_tokens" OWNER TO "supabase_admin";
+
+
+CREATE TABLE IF NOT EXISTS "scripts"."grants" (
+    "script_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "code_id" "uuid" NOT NULL,
+    "granted_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "scripts"."grants" OWNER TO "supabase_admin";
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."metadata" (
@@ -2054,17 +2657,31 @@ COMMENT ON COLUMN "scripts"."protected"."last_revision" IS 'Revision allocator. 
 
 
 
-CREATE TABLE IF NOT EXISTS "scripts"."scripts" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "url" "text" DEFAULT ("gen_random_uuid"())::"text" NOT NULL,
-    "title" "text" NOT NULL,
-    "description" "text" NOT NULL,
-    "content" "text" NOT NULL,
-    "published" boolean DEFAULT false NOT NULL
+CREATE TABLE IF NOT EXISTS "scripts"."redeem_attempts" (
+    "user_id" "uuid" NOT NULL,
+    "attempted_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
 
-ALTER TABLE "scripts"."scripts" OWNER TO "supabase_admin";
+ALTER TABLE "scripts"."redeem_attempts" OWNER TO "supabase_admin";
+
+
+CREATE TABLE IF NOT EXISTS "scripts"."share_codes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "script_id" "uuid" NOT NULL,
+    "code_hash" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "expires_at" timestamp with time zone NOT NULL,
+    "redeemed_by" "uuid",
+    "redeemed_at" timestamp with time zone,
+    "created_by" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    CONSTRAINT "share_codes_code_hash_check" CHECK (("code_hash" ~ '^[0-9a-f]{64}$'::"text")),
+    CONSTRAINT "share_codes_expires_check" CHECK (("expires_at" > "created_at")),
+    CONSTRAINT "share_codes_redeemed_check" CHECK ((("redeemed_by" IS NULL) = ("redeemed_at" IS NULL)))
+);
+
+
+ALTER TABLE "scripts"."share_codes" OWNER TO "supabase_admin";
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."slugs" (
@@ -2076,6 +2693,18 @@ CREATE TABLE IF NOT EXISTS "scripts"."slugs" (
 ALTER TABLE "scripts"."slugs" OWNER TO "supabase_admin";
 
 
+CREATE TABLE IF NOT EXISTS "scripts"."version_keys" (
+    "id" "uuid" NOT NULL,
+    "revision" integer NOT NULL,
+    "key" "bytea" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "version_keys_key_check" CHECK (("octet_length"("key") = 32))
+);
+
+
+ALTER TABLE "scripts"."version_keys" OWNER TO "supabase_admin";
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "id" "uuid" NOT NULL,
     "revision" integer NOT NULL,
@@ -2083,11 +2712,23 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "published_at" timestamp with time zone,
     "status" "scripts"."version_status" DEFAULT 'pending'::"scripts"."version_status" NOT NULL,
-    CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files"))
+    "sizes" bigint[] DEFAULT '{}'::bigint[] NOT NULL,
+    "entry" "text" NOT NULL,
+    CONSTRAINT "versions_entry_check" CHECK (("entry" = ANY ("files"))),
+    CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
+    CONSTRAINT "versions_sizes_check" CHECK (((("cardinality"("sizes") = 0) OR ("cardinality"("sizes") = "cardinality"("files"))) AND (0 <= ALL ("sizes"))))
 );
 
 
 ALTER TABLE "scripts"."versions" OWNER TO "supabase_admin";
+
+
+COMMENT ON COLUMN "scripts"."versions"."sizes" IS 'Byte size of each file in files, in the same order. Required for community authors, who are capped on storage; the real sizes are checked again when the revision goes live (publish_version).';
+
+
+
+COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One of files. Left out on insert, it is the only file of a single-file revision (tr_versions_pre_insert); a revision with several files has to name it.';
+
 
 
 CREATE TABLE IF NOT EXISTS "stats"."limits" (
@@ -2186,6 +2827,11 @@ CREATE TABLE IF NOT EXISTS "stats"."website_monthly" (
 ALTER TABLE "stats"."website_monthly" OWNER TO "supabase_admin";
 
 
+ALTER TABLE ONLY "info"."acceptances"
+    ADD CONSTRAINT "acceptances_pkey" PRIMARY KEY ("user_id", "kind", "version");
+
+
+
 ALTER TABLE ONLY "info"."documents"
     ADD CONSTRAINT "documents_pkey" PRIMARY KEY ("kind", "version");
 
@@ -2246,6 +2892,11 @@ ALTER TABLE ONLY "scripts"."bundles"
 
 
 
+ALTER TABLE ONLY "scripts"."config"
+    ADD CONSTRAINT "config_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "scripts"."deploy_tokens"
     ADD CONSTRAINT "deploy_tokens_pkey" PRIMARY KEY ("id");
 
@@ -2253,6 +2904,11 @@ ALTER TABLE ONLY "scripts"."deploy_tokens"
 
 ALTER TABLE ONLY "scripts"."deploy_tokens"
     ADD CONSTRAINT "deploy_tokens_token_hash_key" UNIQUE ("token_hash");
+
+
+
+ALTER TABLE ONLY "scripts"."grants"
+    ADD CONSTRAINT "grants_pkey" PRIMARY KEY ("script_id", "user_id");
 
 
 
@@ -2276,8 +2932,23 @@ ALTER TABLE ONLY "scripts"."scripts"
 
 
 
+ALTER TABLE ONLY "scripts"."share_codes"
+    ADD CONSTRAINT "share_codes_code_hash_key" UNIQUE ("code_hash");
+
+
+
+ALTER TABLE ONLY "scripts"."share_codes"
+    ADD CONSTRAINT "share_codes_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "scripts"."slugs"
     ADD CONSTRAINT "slugs_pkey" PRIMARY KEY ("slug");
+
+
+
+ALTER TABLE ONLY "scripts"."version_keys"
+    ADD CONSTRAINT "version_keys_pkey" PRIMARY KEY ("id", "revision");
 
 
 
@@ -2353,11 +3024,23 @@ CREATE INDEX "deploy_tokens_script_id_idx" ON "scripts"."deploy_tokens" USING "b
 
 
 
+CREATE INDEX "grants_user_id_idx" ON "scripts"."grants" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_scripts_bundles_author" ON "scripts"."bundles" USING "btree" ("author");
 
 
 
 CREATE INDEX "idx_scripts_protected_author" ON "scripts"."protected" USING "btree" ("author");
+
+
+
+CREATE INDEX "redeem_attempts_user_id_idx" ON "scripts"."redeem_attempts" USING "btree" ("user_id", "attempted_at");
+
+
+
+CREATE INDEX "share_codes_script_id_idx" ON "scripts"."share_codes" USING "btree" ("script_id");
 
 
 
@@ -2421,7 +3104,15 @@ CREATE OR REPLACE TRIGGER "tr_profiles_pre_delete" BEFORE DELETE ON "profiles"."
 
 
 
+CREATE OR REPLACE TRIGGER "tr_profiles_role_change" BEFORE UPDATE OF "role" ON "profiles"."profiles" FOR EACH ROW WHEN (("old"."role" IS DISTINCT FROM "new"."role")) EXECUTE FUNCTION "profiles"."tr_profiles_role_change"();
+
+
+
 CREATE OR REPLACE TRIGGER "tr_metadata_pre_update" BEFORE UPDATE ON "scripts"."metadata" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_metadata_pre_update"();
+
+
+
+CREATE OR REPLACE TRIGGER "tr_protected_post_delete" AFTER DELETE ON "scripts"."protected" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_protected_post_delete"();
 
 
 
@@ -2450,6 +3141,16 @@ CREATE OR REPLACE TRIGGER "tr_versions_pre_insert" BEFORE INSERT ON "scripts"."v
 
 
 CREATE OR REPLACE TRIGGER "wh-scripts.versions" AFTER UPDATE OF "status" ON "scripts"."versions" FOR EACH ROW WHEN (("new"."status" = 'live'::"scripts"."version_status")) EXECUTE FUNCTION "public"."webhook"();
+
+
+
+ALTER TABLE ONLY "info"."acceptances"
+    ADD CONSTRAINT "acceptances_document_fkey" FOREIGN KEY ("kind", "version") REFERENCES "info"."documents"("kind", "version");
+
+
+
+ALTER TABLE ONLY "info"."acceptances"
+    ADD CONSTRAINT "acceptances_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
 
 
 
@@ -2483,6 +3184,21 @@ ALTER TABLE ONLY "scripts"."deploy_tokens"
 
 
 
+ALTER TABLE ONLY "scripts"."grants"
+    ADD CONSTRAINT "grants_code_id_fkey" FOREIGN KEY ("code_id") REFERENCES "scripts"."share_codes"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."grants"
+    ADD CONSTRAINT "grants_script_id_fkey" FOREIGN KEY ("script_id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."grants"
+    ADD CONSTRAINT "grants_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "scripts"."metadata"
     ADD CONSTRAINT "metadata_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON UPDATE CASCADE ON DELETE CASCADE;
 
@@ -2498,8 +3214,33 @@ ALTER TABLE ONLY "scripts"."protected"
 
 
 
+ALTER TABLE ONLY "scripts"."redeem_attempts"
+    ADD CONSTRAINT "redeem_attempts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."share_codes"
+    ADD CONSTRAINT "share_codes_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."share_codes"
+    ADD CONSTRAINT "share_codes_redeemed_by_fkey" FOREIGN KEY ("redeemed_by") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."share_codes"
+    ADD CONSTRAINT "share_codes_script_id_fkey" FOREIGN KEY ("script_id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "scripts"."slugs"
     ADD CONSTRAINT "slugs_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."version_keys"
+    ADD CONSTRAINT "version_keys_version_fkey" FOREIGN KEY ("id", "revision") REFERENCES "scripts"."versions"("id", "revision") ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 
@@ -2549,6 +3290,13 @@ CREATE POLICY "INSERT for ADMINISTRATOR" ON "info"."documents" FOR INSERT TO "au
 
 CREATE POLICY "SELECT for EVERYONE" ON "info"."documents" FOR SELECT USING (true);
 
+
+
+CREATE POLICY "SELECT for OWNER" ON "info"."acceptances" FOR SELECT TO "authenticated" USING (("user_id" = ( SELECT "auth"."uid"() AS "uid")));
+
+
+
+ALTER TABLE "info"."acceptances" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "info"."documents" ENABLE ROW LEVEL SECURITY;
@@ -2613,19 +3361,31 @@ CREATE POLICY "DELETE for AUTHOR" ON "scripts"."deploy_tokens" FOR DELETE TO "au
 
 
 
+CREATE POLICY "DELETE for AUTHOR" ON "scripts"."share_codes" FOR DELETE TO "authenticated" USING ((("redeemed_at" IS NULL) AND ("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id"))));
+
+
+
+CREATE POLICY "DELETE for HOLDER and AUTHOR" ON "scripts"."grants" FOR DELETE TO "authenticated" USING ((("user_id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
+
+
+
+CREATE POLICY "DELETE for MODERATOR" ON "scripts"."scripts" FOR DELETE TO "authenticated" USING ("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"));
+
+
+
+CREATE POLICY "INSERT for ALLOWED" ON "scripts"."scripts" FOR INSERT TO "authenticated" WITH CHECK ("scripts"."can_create_script"());
+
+
+
 CREATE POLICY "INSERT for AUTHOR" ON "scripts"."deploy_tokens" FOR INSERT TO "authenticated" WITH CHECK (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
 
 
 
-CREATE POLICY "INSERT for AUTHOR" ON "scripts"."versions" FOR INSERT TO "authenticated" WITH CHECK (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "id")));
+CREATE POLICY "INSERT for AUTHOR" ON "scripts"."versions" FOR INSERT TO "authenticated" WITH CHECK ((("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "id")) AND "profiles"."has_accepted_terms"("profiles"."uid"())));
 
 
 
 CREATE POLICY "INSERT for SCRIPTER" ON "scripts"."bundles" FOR INSERT TO "authenticated" WITH CHECK ((("author" = "profiles"."uid"()) AND "profiles"."min_role"("profiles"."uid"(), 'scripter'::"profiles"."roles")));
-
-
-
-CREATE POLICY "INSERT for SCRIPTER" ON "scripts"."scripts" FOR INSERT TO "authenticated" WITH CHECK ("profiles"."min_role"("profiles"."uid"(), 'scripter'::"profiles"."roles"));
 
 
 
@@ -2649,11 +3409,23 @@ CREATE POLICY "SELECT for AUTHOR" ON "scripts"."deploy_tokens" FOR SELECT TO "au
 
 
 
-CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT TO "authenticated" USING (("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
+CREATE POLICY "SELECT for AUTHOR" ON "scripts"."share_codes" FOR SELECT TO "authenticated" USING (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
+
+
+
+CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT TO "authenticated" USING (("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR ("profiles"."min_role"("profiles"."uid"(), 'tester'::"profiles"."roles") AND "scripts"."is_reviewable"("id"))));
 
 
 
 CREATE POLICY "SELECT for EVERYONE" ON "scripts"."bundles" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "SELECT for EVERYONE" ON "scripts"."config" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "SELECT for HOLDER and AUTHOR" ON "scripts"."grants" FOR SELECT TO "authenticated" USING ((("user_id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
 
 
 
@@ -2672,7 +3444,13 @@ CREATE POLICY "UPDATE for AUTHOR" ON "scripts"."scripts" FOR UPDATE TO "authenti
 ALTER TABLE "scripts"."bundles" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "scripts"."config" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "scripts"."deploy_tokens" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "scripts"."grants" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "scripts"."metadata" ENABLE ROW LEVEL SECURITY;
@@ -2681,10 +3459,19 @@ ALTER TABLE "scripts"."metadata" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "scripts"."protected" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "scripts"."redeem_attempts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "scripts"."scripts" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "scripts"."share_codes" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "scripts"."slugs" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "scripts"."version_keys" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "scripts"."versions" ENABLE ROW LEVEL SECURITY;
@@ -2791,6 +3578,13 @@ GRANT ALL ON TYPE "scripts"."version_status" TO "postgres";
 
 
 
+REVOKE ALL ON FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) TO "postgres";
+GRANT ALL ON FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "info"."tr_documents_pre_insert"() FROM PUBLIC;
 
 
@@ -2855,7 +3649,6 @@ GRANT ALL ON FUNCTION "payments"."settle_payment"("p_payment" "uuid") TO "servic
 
 
 REVOKE ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") TO "postgres";
 GRANT ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") TO "service_role";
 
 
@@ -2920,6 +3713,13 @@ REVOKE ALL ON FUNCTION "profiles"."handle_new_user"() FROM PUBLIC;
 
 
 
+REVOKE ALL ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."is_banned"("user_id" "uuid") TO "service_role";
 
@@ -2974,6 +3774,11 @@ REVOKE ALL ON FUNCTION "profiles"."tr_impersonations_immutable"() FROM PUBLIC;
 
 
 
+REVOKE ALL ON FUNCTION "profiles"."tr_profiles_role_change"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."tr_profiles_role_change"() TO "postgres";
+
+
+
 GRANT ALL ON FUNCTION "profiles"."uid"() TO "anon";
 GRANT ALL ON FUNCTION "profiles"."uid"() TO "authenticated";
 GRANT ALL ON FUNCTION "profiles"."uid"() TO "service_role";
@@ -2992,6 +3797,48 @@ GRANT ALL ON FUNCTION "public"."webhook"() TO "service_role";
 
 
 
+GRANT SELECT ON TABLE "scripts"."scripts" TO "anon";
+GRANT SELECT,DELETE ON TABLE "scripts"."scripts" TO "authenticated";
+GRANT ALL ON TABLE "scripts"."scripts" TO "service_role";
+
+
+
+GRANT INSERT("title"),UPDATE("title") ON TABLE "scripts"."scripts" TO "authenticated";
+
+
+
+GRANT INSERT("description"),UPDATE("description") ON TABLE "scripts"."scripts" TO "authenticated";
+
+
+
+GRANT INSERT("content"),UPDATE("content") ON TABLE "scripts"."scripts" TO "authenticated";
+
+
+
+GRANT UPDATE("published") ON TABLE "scripts"."scripts" TO "authenticated";
+
+
+
+GRANT ALL ON FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") TO "anon";
+GRANT ALL ON FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."author_is_banned"("script_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."author_is_banned"("script_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."author_is_banned"("script_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "scripts"."author_is_community"("script_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "scripts"."author_is_community"("script_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."author_is_community"("script_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."author_is_community"("script_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "service_role";
@@ -3000,6 +3847,13 @@ GRANT ALL ON FUNCTION "scripts"."can_access"("script_id" "uuid") TO "service_rol
 
 REVOKE ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."can_create_script"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."can_create_script"() TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."can_create_script"() TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."can_create_script"() TO "service_role";
 
 
 
@@ -3012,6 +3866,18 @@ GRANT ALL ON FUNCTION "scripts"."can_upload"("object_name" "text") TO "service_r
 GRANT ALL ON FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."delete_expired_share_codes"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."delete_expired_share_codes"() TO "postgres";
 
 
 
@@ -3029,15 +3895,42 @@ GRANT ALL ON FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) TO "service
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."get_community_usage"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."get_community_usage"() TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."get_community_usage"() TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."get_community_usage"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."get_revision"("script_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."get_revision"("script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."get_revision"("script_id" "uuid") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "scripts"."is_community"("s" "scripts"."scripts") TO "anon";
+GRANT ALL ON FUNCTION "scripts"."is_community"("s" "scripts"."scripts") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."is_community"("s" "scripts"."scripts") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."is_community"("s" "scripts"."scripts") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") TO "anon";
+GRANT ALL ON FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."is_granted"("s" "scripts"."scripts") TO "service_role";
 
 
 
@@ -3054,9 +3947,23 @@ GRANT ALL ON FUNCTION "scripts"."is_premium"("script_id" "uuid") TO "service_rol
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."is_reviewable"("script_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."is_reviewable"("script_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."is_reviewable"("script_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."is_reviewable"("script_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."list_grantees"("p_script" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."list_grantees"("p_script" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."list_grantees"("p_script" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."list_grantees"("p_script" "uuid") TO "service_role";
 
 
 
@@ -3079,13 +3986,37 @@ GRANT ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision"
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."safe_uuid"("value" "text") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."safe_uuid"("value" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."safe_uuid"("value" "text") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean) TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "scripts"."tr_metadata_pre_update"() FROM PUBLIC;
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."tr_protected_post_delete"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."tr_protected_post_delete"() TO "postgres";
 
 
 
@@ -3152,6 +4083,12 @@ GRANT ALL ON FUNCTION "stats"."online_per_script"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) TO "service_role";
+
+
+
+GRANT SELECT ON TABLE "info"."acceptances" TO "authenticated";
+GRANT ALL ON TABLE "info"."acceptances" TO "postgres";
+GRANT ALL ON TABLE "info"."acceptances" TO "service_role";
 
 
 
@@ -3230,6 +4167,13 @@ GRANT INSERT("scripts"),UPDATE("scripts") ON TABLE "scripts"."bundles" TO "authe
 
 
 
+GRANT SELECT ON TABLE "scripts"."config" TO "anon";
+GRANT SELECT ON TABLE "scripts"."config" TO "authenticated";
+GRANT ALL ON TABLE "scripts"."config" TO "postgres";
+GRANT ALL ON TABLE "scripts"."config" TO "service_role";
+
+
+
 GRANT DELETE ON TABLE "scripts"."deploy_tokens" TO "authenticated";
 GRANT ALL ON TABLE "scripts"."deploy_tokens" TO "service_role";
 
@@ -3263,6 +4207,24 @@ GRANT SELECT("last_used_at") ON TABLE "scripts"."deploy_tokens" TO "authenticate
 
 
 
+GRANT DELETE ON TABLE "scripts"."grants" TO "authenticated";
+GRANT ALL ON TABLE "scripts"."grants" TO "postgres";
+GRANT ALL ON TABLE "scripts"."grants" TO "service_role";
+
+
+
+GRANT SELECT("script_id") ON TABLE "scripts"."grants" TO "authenticated";
+
+
+
+GRANT SELECT("user_id") ON TABLE "scripts"."grants" TO "authenticated";
+
+
+
+GRANT SELECT("granted_at") ON TABLE "scripts"."grants" TO "authenticated";
+
+
+
 GRANT SELECT ON TABLE "scripts"."metadata" TO "anon";
 GRANT SELECT ON TABLE "scripts"."metadata" TO "authenticated";
 GRANT ALL ON TABLE "scripts"."metadata" TO "service_role";
@@ -3291,31 +4253,48 @@ GRANT ALL ON TABLE "scripts"."protected" TO "service_role";
 
 
 
-GRANT SELECT ON TABLE "scripts"."scripts" TO "anon";
-GRANT SELECT ON TABLE "scripts"."scripts" TO "authenticated";
-GRANT ALL ON TABLE "scripts"."scripts" TO "service_role";
+GRANT ALL ON TABLE "scripts"."redeem_attempts" TO "postgres";
+GRANT ALL ON TABLE "scripts"."redeem_attempts" TO "service_role";
 
 
 
-GRANT INSERT("title"),UPDATE("title") ON TABLE "scripts"."scripts" TO "authenticated";
+GRANT DELETE ON TABLE "scripts"."share_codes" TO "authenticated";
+GRANT ALL ON TABLE "scripts"."share_codes" TO "postgres";
+GRANT ALL ON TABLE "scripts"."share_codes" TO "service_role";
 
 
 
-GRANT INSERT("description"),UPDATE("description") ON TABLE "scripts"."scripts" TO "authenticated";
+GRANT SELECT("id") ON TABLE "scripts"."share_codes" TO "authenticated";
 
 
 
-GRANT INSERT("content"),UPDATE("content") ON TABLE "scripts"."scripts" TO "authenticated";
+GRANT SELECT("script_id") ON TABLE "scripts"."share_codes" TO "authenticated";
 
 
 
-GRANT UPDATE("published") ON TABLE "scripts"."scripts" TO "authenticated";
+GRANT SELECT("created_at") ON TABLE "scripts"."share_codes" TO "authenticated";
+
+
+
+GRANT SELECT("expires_at") ON TABLE "scripts"."share_codes" TO "authenticated";
+
+
+
+GRANT SELECT("redeemed_at") ON TABLE "scripts"."share_codes" TO "authenticated";
+
+
+
+GRANT SELECT("created_by") ON TABLE "scripts"."share_codes" TO "authenticated";
 
 
 
 GRANT SELECT ON TABLE "scripts"."slugs" TO "anon";
 GRANT SELECT ON TABLE "scripts"."slugs" TO "authenticated";
 GRANT ALL ON TABLE "scripts"."slugs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "scripts"."version_keys" TO "service_role";
 
 
 
@@ -3330,6 +4309,14 @@ GRANT INSERT("id") ON TABLE "scripts"."versions" TO "authenticated";
 
 
 GRANT INSERT("files") ON TABLE "scripts"."versions" TO "authenticated";
+
+
+
+GRANT INSERT("sizes") ON TABLE "scripts"."versions" TO "authenticated";
+
+
+
+GRANT INSERT("entry") ON TABLE "scripts"."versions" TO "authenticated";
 
 
 
@@ -3468,7 +4455,7 @@ CREATE POLICY "scripts DELETE for supabase_admin" ON "storage"."objects" FOR DEL
 
 CREATE POLICY "scripts INSERT for author" ON "storage"."objects" FOR INSERT TO "authenticated" WITH CHECK ((("bucket_id" = 'scripts'::"text") AND "scripts"."can_upload"("name")));
 
-CREATE POLICY "scripts SELECT for author" ON "storage"."objects" FOR SELECT TO "authenticated" USING ((("bucket_id" = 'scripts'::"text") AND ("scripts"."is_object_author"("profiles"."uid"(), "name") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"))));
+CREATE POLICY "scripts SELECT for author" ON "storage"."objects" FOR SELECT TO "authenticated" USING ((("bucket_id" = 'scripts'::"text") AND ("scripts"."is_object_author"("profiles"."uid"(), "name") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR ("profiles"."min_role"("profiles"."uid"(), 'tester'::"profiles"."roles") AND "scripts"."is_reviewable"("scripts"."safe_uuid"("split_part"("name", '/'::"text", 1)))))));
 
 ALTER TABLE "storage"."vector_indexes" ENABLE ROW LEVEL SECURITY;
 
