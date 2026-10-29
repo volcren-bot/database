@@ -34,7 +34,7 @@ INSERT INTO scripts.scripts (id, title, description, content, published) VALUES 
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000002');
 INSERT INTO scripts.scripts (id, title, description, content, published) VALUES ('10000000-0000-0000-0000-000000000002', 'Fishing', 'd', 'c', true);
 
--- managing tokens ----------------------------------------------------------------
+-- managing tokens
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT lives_ok($$INSERT INTO scripts.deploy_tokens (script_id, name, token_hash) VALUES ('10000000-0000-0000-0000-000000000001', 'ci', repeat('a', 64))$$, 'the author can create a deploy token');
@@ -57,7 +57,7 @@ DELETE FROM scripts.deploy_tokens;
 RESET ROLE;
 SELECT is((SELECT count(*)::int FROM scripts.deploy_tokens), 2, 'other users revoked nothing');
 
--- checking tokens --------------------------------------------------------------------
+-- checking tokens
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_ok($$SELECT scripts.use_deploy_token('10000000-0000-0000-0000-000000000001', repeat('a', 64))$$, '42501', NULL, 'clients cannot call use_deploy_token');
@@ -70,7 +70,7 @@ SELECT ok((SELECT last_used_at IS NOT NULL FROM scripts.deploy_tokens WHERE name
 SELECT throws_ok($$SELECT scripts.use_deploy_token('10000000-0000-0000-0000-000000000001', repeat('c', 64))$$, '42501', 'invalid deploy token', 'an unknown token is rejected');
 SELECT throws_ok($$SELECT scripts.use_deploy_token('10000000-0000-0000-0000-000000000002', repeat('a', 64))$$, '42501', 'invalid deploy token', 'a token only works for its own script');
 
--- publishing as service_role -----------------------------------------------------------
+-- publishing as service_role
 INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau']);
 INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/main.luau');
 SELECT lives_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, 'service_role can set a revision key');
@@ -86,7 +86,7 @@ SELECT set_config('request.jwt.claims', '{"role":"authenticated"}', true);
 SELECT throws_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 3)$$, '42501', 'not allowed', 'a caller that is neither a user nor service_role still cannot publish');
 RESET ROLE;
 
--- losing access ------------------------------------------------------------------------
+-- losing access
 UPDATE profiles.profiles SET role = 'user' WHERE id = '00000000-0000-0000-0000-000000000003';
 SET LOCAL ROLE service_role;
 SELECT pg_temp.act_service();

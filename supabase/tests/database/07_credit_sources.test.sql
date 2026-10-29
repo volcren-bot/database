@@ -16,7 +16,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000001', 'admin', 'administ
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'mod', 'moderator');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'user');
 
--- Manual adjustments ---------------------------------------------------------
+-- Manual adjustments
 
 SELECT is(payments.adjust_credits('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 250000, '  goodwill  '),
   250000::bigint, 'an administrator can grant credits');
@@ -38,7 +38,7 @@ SELECT throws_ok($$SELECT payments.adjust_credits('00000000-0000-0000-0000-00000
 SELECT throws_ok($$SELECT payments.adjust_credits('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', -999999, 'too much')$$,
   '23514', NULL, 'an adjustment cannot overdraw an account');
 
--- Top-ups with a bonus ---------------------------------------------------------
+-- Top-ups with a bonus
 
 INSERT INTO payments.payments (id, user_id, provider, provider_id, credits, bonus, amount)
 VALUES ('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'bitcart', 'inv-1', 1065051, 65051, 10000);
@@ -53,7 +53,7 @@ SELECT throws_ok($$INSERT INTO payments.payments (user_id, provider, provider_id
   VALUES ('00000000-0000-0000-0000-000000000003', 'bitcart', 'inv-2', 1000, 1000, 100)$$,
   '23514', NULL, 'the bonus is part of the credits, not all of them');
 
--- Privileges --------------------------------------------------------------------
+-- Privileges
 
 SET LOCAL ROLE authenticated;
 SELECT throws_ok($$SELECT payments.adjust_credits('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 1, 'self-service')$$,

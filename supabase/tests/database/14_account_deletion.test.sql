@@ -38,7 +38,7 @@ SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', '00000000-000
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 SELECT payments.post_earnings('00000000-0000-0000-0000-000000000003', 'adjustment', 5);
 
--- deleting a user ends and charges their running scripts --------------------------------
+-- deleting a user ends and charges their running scripts
 CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 UPDATE payments.sessions SET started_at = started_at - interval '3 minutes', charged_until = charged_until - interval '3 minutes';
@@ -52,7 +52,7 @@ SELECT is((SELECT sum(amount)::bigint FROM payments.credits_ledger WHERE session
 SELECT is((SELECT earnings FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001'), 24::bigint, 'so the author was paid');
 SELECT is((SELECT count(*)::int FROM payments.credits_ledger WHERE user_id = '00000000-0000-0000-0000-000000000002'), 2, 'the ledger outlives the account');
 
--- what blocks a deletion --------------------------------------------------------------
+-- what blocks a deletion
 SELECT throws_ok($$DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-000000000004'$$, '23503', NULL,
   'a scripter who still authors scripts cannot be deleted');
 SELECT throws_ok($$DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-000000000003'$$, '23001', NULL,

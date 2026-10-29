@@ -36,7 +36,7 @@ INSERT INTO scripts.scripts (id, title, description, content, published) VALUES 
 UPDATE scripts.metadata SET stage = 'stable' WHERE id = '10000000-0000-0000-0000-000000000001';
 INSERT INTO scripts.versions (id, files, entry) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau', 'lib.luau'], 'main.luau');
 
--- revision allocation -------------------------------------------------------
+-- revision allocation
 SELECT is((SELECT status::text FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001'), 'pending', 'a new revision is pending');
 SELECT is((SELECT revision FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001'), 1, 'it gets revision 1');
 SELECT is((SELECT revision FROM scripts.protected WHERE id = '10000000-0000-0000-0000-000000000001'), 0, 'a pending revision does not change protected.revision');
@@ -45,7 +45,7 @@ SELECT is((SELECT count(*)::int FROM public.test_http_log), 0, 'inserting a revi
 SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['x'])$$, '23505', NULL, 'a second pending revision is rejected');
 SELECT is((SELECT can_access FROM (SELECT scripts.can_access('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001')) t(can_access)), false, 'a script without a live revision cannot be run, even by its author');
 
--- uploads --------------------------------------------------------------------
+-- uploads
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_ok($$INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/other.luau')$$, '42501', NULL, 'an unlisted file is denied');
@@ -54,7 +54,7 @@ SELECT throws_ok($$INSERT INTO storage.objects (bucket_id, name) VALUES ('script
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000002');
 SELECT throws_ok($$INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/lib.luau')$$, '42501', NULL, 'another scripter cannot upload');
 
--- publishing -------------------------------------------------------------------
+-- publishing
 SELECT throws_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, '42501', 'not allowed', 'another scripter cannot publish');
 SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, '42501', 'not allowed', 'nor set its key');
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
@@ -92,11 +92,11 @@ UPDATE scripts.metadata SET stage = 'stable' WHERE id = '10000000-0000-0000-0000
 SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000002'), false, 'a script without a live revision is not viewable by users');
 SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002'), true, 'but the author can view it');
 
--- price limits ---------------------------------------------------------------------
+-- price limits
 SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 23 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
 SELECT lives_ok($$UPDATE scripts.metadata SET type = 'premium', price = 22 WHERE id = '10000000-0000-0000-0000-000000000002'$$, 'the maximum price is allowed');
 
--- entry file -------------------------------------------------------------------------
+-- entry file
 SELECT is((SELECT entry FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001' AND revision = 3), 'main.luau', 'a single file is the entry');
 UPDATE scripts.versions SET status = 'discarded' WHERE id = '10000000-0000-0000-0000-000000000001' AND status = 'pending';
 INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['bot.luau']);
@@ -104,7 +104,7 @@ SELECT is((SELECT entry FROM scripts.versions WHERE id = '10000000-0000-0000-000
 SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['a.luau', 'b.luau'])$$, '22023', NULL, 'several files need an entry');
 SELECT throws_ok($$INSERT INTO scripts.versions (id, files, entry) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['a.luau', 'b.luau'], 'c.luau')$$, '23514', NULL, 'the entry has to be one of the files');
 
--- revision file names -----------------------------------------------------------------
+-- revision file names
 SELECT is(scripts.valid_files(ARRAY['main.luau', 'lib/util.luau', 'a_b-c..d', '.config']), true, 'plain names and subfolders are valid');
 SELECT is(scripts.valid_files('{}'), false, 'a revision needs a file');
 SELECT is(scripts.valid_files((SELECT array_agg('f' || i) FROM generate_series(1, 50) i)), true, '50 files are allowed');
@@ -117,7 +117,7 @@ SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_ok($$INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000002', ARRAY['../escape.luau'])$$, '23514', NULL, 'an author cannot insert a revision with an invalid file name');
 RESET ROLE;
 
--- deleting accounts -------------------------------------------------------------------
+-- deleting accounts
 SELECT throws_ok($$DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-000000000001'$$, '23503', NULL, 'a user who authors scripts cannot be deleted');
 SELECT is((SELECT count(*)::int FROM profiles.profiles WHERE id = '00000000-0000-0000-0000-000000000001'), 1, 'and nothing was deleted');
 DELETE FROM auth.users WHERE id = '00000000-0000-0000-0000-000000000004';

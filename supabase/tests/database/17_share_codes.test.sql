@@ -94,7 +94,7 @@ INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-
 RESET ROLE;
 UPDATE scripts.scripts SET published = false WHERE id = '10000000-0000-0000-0000-000000000001';
 
--- creating codes -----------------------------------------------------------------------
+-- creating codes
 CREATE TEMP TABLE codes (name text, code text);
 GRANT ALL ON codes TO authenticated;
 
@@ -156,7 +156,7 @@ SELECT lives_ok($$SELECT * FROM scripts.create_share_code('10000000-0000-0000-00
 SELECT is((SELECT count(*)::int FROM scripts.share_codes WHERE expires_at > now()), 20, 'twenty codes are open again');
 RESET ROLE;
 
--- redeeming ------------------------------------------------------------------------------
+-- redeeming
 CREATE TEMP TABLE r (c text);
 SELECT is(pg_temp.redeem('00000000-0000-0000-0000-000000000004', 'not a code'), 'invalid', 'a malformed code is invalid');
 SELECT is(pg_temp.redeem('00000000-0000-0000-0000-000000000004', NULL), 'invalid', 'so is no code');
@@ -208,7 +208,7 @@ SELECT is(pg_temp.redeem('00000000-0000-0000-0000-000000000005', (SELECT code FR
 SELECT ok(scripts.can_view('00000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000002'), 'codes work for community scripts');
 SELECT ok(NOT scripts.can_view('00000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000002'), 'and only for whoever redeemed them');
 
--- who is told what ------------------------------------------------------------------------
+-- who is told what
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SET LOCAL ROLE authenticated;
 SELECT is((SELECT array_agg(username) FROM scripts.list_grantees('10000000-0000-0000-0000-000000000001')), ARRAY['friend'], 'the owner lists who redeemed, by username');
@@ -221,7 +221,7 @@ SELECT pg_temp.act('00000000-0000-0000-0000-000000000003');
 SELECT is((SELECT count(*)::int FROM scripts.list_grantees('10000000-0000-0000-0000-000000000001')), 1, 'a moderator lists any script''s grantees');
 RESET ROLE;
 
--- running: grantees pay nothing, banned authors stop --------------------------------------
+-- running: grantees pay nothing, banned authors stop
 UPDATE scripts.scripts SET published = true WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000004');
 SELECT set_config('request.jwt.claims', '{"role":"service_role"}', true);
@@ -236,7 +236,7 @@ SELECT throws_ok($$SELECT * FROM payments.start_session('00000000-0000-0000-0000
 SELECT throws_ok($$SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'not even for a moderator');
 UPDATE profiles.profiles SET banned_at = NULL WHERE id = '00000000-0000-0000-0000-000000000001';
 
--- revoking ------------------------------------------------------------------------------
+-- revoking
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SET LOCAL ROLE authenticated;
 DELETE FROM scripts.share_codes WHERE redeemed_at IS NOT NULL;
@@ -267,7 +267,7 @@ RESET ROLE;
 SELECT is((SELECT count(*)::int FROM scripts.grants WHERE script_id = '10000000-0000-0000-0000-000000000002'), 0, 'a recipient removes the script from their account');
 SELECT ok(NOT scripts.can_view('00000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000002'), 'and loses it');
 
--- cleanup and cascades -----------------------------------------------------------------------
+-- cleanup and cascades
 INSERT INTO scripts.share_codes (script_id, code_hash, created_by, created_at, expires_at)
 VALUES ('10000000-0000-0000-0000-000000000001', repeat('c', 64), '00000000-0000-0000-0000-000000000001', now() - interval '2 days', now() - interval '1 day');
 UPDATE scripts.redeem_attempts SET attempted_at = now() - interval '2 hours' WHERE user_id = '00000000-0000-0000-0000-000000000004';

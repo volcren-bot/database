@@ -1,9 +1,4 @@
--- Schema: info (rewritten for Volcren)
---
--- Legal documents, one row per published version. The old privacy_policy,
--- user_tos and scripter_tos tables (identical shape) are merged into
--- info.documents. The latest version of a kind is the current one.
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
+-- Schema info: legal documents, one row per published version (the latest is current)
 
 
 CREATE SCHEMA IF NOT EXISTS "info";
@@ -29,8 +24,7 @@ CREATE TABLE IF NOT EXISTS "info"."documents" (
 ALTER TABLE ONLY "info"."documents"
     ADD CONSTRAINT "documents_pkey" PRIMARY KEY ("kind", "version");
 
--- Which version of a document a user accepted. Rows are only added by accept_terms, which
--- takes the current version alone; profiles.has_accepted_terms reads them.
+-- Which document version each user accepted, written only by accept_terms
 CREATE TABLE IF NOT EXISTS "info"."acceptances" (
     "user_id" "uuid" NOT NULL,
     "kind" "info"."kind" NOT NULL,
@@ -47,8 +41,7 @@ ALTER TABLE ONLY "info"."acceptances"
 ALTER TABLE ONLY "info"."acceptances"
     ADD CONSTRAINT "acceptances_document_fkey" FOREIGN KEY ("kind", "version") REFERENCES "info"."documents"("kind", "version");
 
--- Versions count up per kind, starting at 1. Published documents are
--- immutable: there is no UPDATE or DELETE grant.
+-- Versions count up per kind from 1; published documents are immutable
 CREATE OR REPLACE FUNCTION "info"."tr_documents_pre_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -65,8 +58,7 @@ $$;
 
 CREATE OR REPLACE TRIGGER "tr_documents_pre_insert" BEFORE INSERT ON "info"."documents" FOR EACH ROW EXECUTE FUNCTION "info"."tr_documents_pre_insert"();
 
--- Records that the caller accepted a scripter_tos or community_tos version. Only the current
--- (latest) version can be accepted; accepting it again changes nothing.
+-- Accepts the current scripter_tos or community_tos version; repeating changes nothing
 CREATE OR REPLACE FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''

@@ -37,7 +37,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000005', 'author', 'scripte
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 10);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 1000);
 
--- who can ban whom ---------------------------------------------------------------------
+-- who can ban whom
 SELECT throws_ok($$SELECT profiles.set_banned('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000004', true, 'spam')$$,
   '42501', 'only administrators can ban', 'a moderator cannot ban');
 SELECT throws_ok($$SELECT profiles.set_banned(NULL, '00000000-0000-0000-0000-000000000004', true, 'spam')$$,
@@ -50,7 +50,7 @@ SELECT throws_ok($$SELECT profiles.set_banned('00000000-0000-0000-0000-000000000
   'P0001', 'a reason is required', 'a ban needs a reason');
 SELECT is((SELECT count(*)::int FROM profiles.bans), 0, 'refused bans are not recorded');
 
--- a ban ends running scripts ----------------------------------------------------------
+-- a ban ends running scripts
 CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 UPDATE payments.sessions SET started_at = started_at - interval '3 minutes', charged_until = charged_until - interval '3 minutes';
@@ -69,7 +69,7 @@ SELECT is(profiles.set_banned('00000000-0000-0000-0000-000000000001', '00000000-
   'banning a banned user changes nothing');
 SELECT is((SELECT count(*)::int FROM profiles.bans), 1, 'and records nothing');
 
--- what a banned user can't do --------------------------------------------------------
+-- what a banned user can't do
 SELECT throws_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001')$$,
   '42501', 'account banned', 'a banned user cannot start a session');
 
@@ -89,7 +89,7 @@ SELECT throws_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-00000
 RESET ROLE;
 SELECT is((SELECT revision FROM scripts.protected WHERE id = '10000000-0000-0000-0000-000000000001'), 1, 'the live revision is unchanged');
 
--- unbanning ----------------------------------------------------------------------------
+-- unbanning
 SELECT is(profiles.set_banned('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000005', false, 'false positive'), true,
   'any administrator can lift a ban');
 SELECT ok(NOT profiles.is_banned('00000000-0000-0000-0000-000000000005'), 'the user is no longer banned');
@@ -99,7 +99,7 @@ SELECT is(profiles.set_banned('00000000-0000-0000-0000-000000000002', '00000000-
   'unbanning a user who is not banned changes nothing');
 SELECT is((SELECT count(*)::int FROM profiles.bans WHERE NOT banned), 1, 'the unban is recorded once');
 
--- the record is append-only and private -------------------------------------------------
+-- the record is append-only and private
 SELECT throws_like($$DELETE FROM profiles.bans$$, '%append-only%', 'ban records cannot be deleted');
 SELECT throws_like($$UPDATE profiles.bans SET reason = 'x'$$, '%append-only%', 'or changed');
 

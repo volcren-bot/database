@@ -59,7 +59,7 @@ SELECT is(pg_temp.url_of('40000000-0000-0000-0000-000000000004'), 'new-40000000'
 INSERT INTO scripts.scripts (id, title, description, content) VALUES ('50000000-0000-0000-0000-000000000005', '!!!', 'd', 'c');
 SELECT is(pg_temp.url_of('50000000-0000-0000-0000-000000000005'), 'script', 'a title with no usable characters falls back to "script"');
 
--- access -------------------------------------------------------------------------
+-- access
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_ok($$UPDATE scripts.scripts SET url = 'hijack' WHERE id = '10000000-0000-0000-0000-000000000001'$$, '42501', NULL, 'authors cannot write the url directly');

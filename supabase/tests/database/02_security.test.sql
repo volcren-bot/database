@@ -38,7 +38,7 @@ SET LOCAL ROLE authenticated;
 SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1);
 RESET ROLE;
 
--- RLS per role -------------------------------------------------------------
+-- RLS per role
 SELECT set_config('request.jwt.claims', '', true);
 SET LOCAL ROLE anon;
 SELECT is((SELECT count(*)::int FROM scripts.scripts), 1, 'anon sees the published script only');
@@ -74,7 +74,7 @@ SELECT is((SELECT count(*)::int FROM scripts.scripts), 2, 'a moderator sees ever
 SELECT is((SELECT count(*)::int FROM scripts.versions), 1, 'a moderator reads the versions');
 RESET ROLE;
 
--- column grants ------------------------------------------------------------
+-- column grants
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000004');
 SELECT throws_ok($$UPDATE profiles.profiles SET role = 'administrator' WHERE id = '00000000-0000-0000-0000-000000000004'$$, '42501', NULL, 'a client cannot write role');
@@ -85,7 +85,7 @@ SELECT throws_ok($$UPDATE scripts.protected SET revision = 9$$, '42501', NULL, '
 SELECT throws_ok($$UPDATE scripts.metadata SET stage = 'alpha' WHERE id = '10000000-0000-0000-0000-000000000001'$$, '23514', NULL, 'stage cannot go backwards');
 RESET ROLE;
 
--- ledgers and payments ----------------------------------------------------
+-- ledgers and payments
 INSERT INTO payments.payments (id, user_id, provider, provider_id, credits, amount)
 VALUES ('20000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'bitcart', 'inv-1', 50000, 500);
 

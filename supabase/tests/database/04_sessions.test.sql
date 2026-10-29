@@ -47,7 +47,7 @@ SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment
 
 CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[], entry text);
 
--- starting -------------------------------------------------------------------
+-- starting
 INSERT INTO s SELECT 'a', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT is((SELECT revision FROM s WHERE name = 'a'), 1, 'start_session returns the live revision');
 SELECT is((SELECT files FROM s WHERE name = 'a'), ARRAY['main.luau'], 'and its files');
@@ -55,7 +55,7 @@ SELECT is((SELECT price FROM payments.sessions WHERE id = (SELECT id FROM s WHER
 SELECT is(stats.online_count(), 1::bigint, 'an open session counts as online');
 SELECT throws_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'a balance below one minute cannot start a session');
 
--- a price change during a session does not change what that session pays --------------
+-- a price change during a session does not change what that session pays
 UPDATE scripts.metadata SET price = 20 WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'a'), interval '5 minutes');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), true, 'a heartbeat charges the elapsed minutes and keeps the session running');
@@ -63,7 +63,7 @@ SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-
 
 UPDATE scripts.metadata SET price = 10 WHERE id = '10000000-0000-0000-0000-000000000001';
 
--- 10 minutes charged by heartbeats + the remaining 2 minutes at the end ------------------------
+-- 10 minutes charged by heartbeats + the remaining 2 minutes at the end
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'a'), interval '5 minutes');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), true, 'the second heartbeat');
 SELECT is((SELECT count(*)::int FROM payments.credits_ledger WHERE kind = 'usage' AND session_id = (SELECT id FROM s WHERE name = 'a')), 2, 'two heartbeats are charged');
@@ -76,7 +76,7 @@ SELECT is(payments.end_session((SELECT id FROM s WHERE name = 'a'), 'stopped'), 
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), false, 'a heartbeat on an ended session says stop');
 SELECT is(stats.online_count(), 0::bigint, 'an ended session is not online');
 
--- 1 credit/minute with the 20% fee pays the author 4 credits per 5 minutes ----------
+-- 1 credit/minute with the 20% fee pays the author 4 credits per 5 minutes
 INSERT INTO s SELECT 'b', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000003');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'b'), interval '5 minutes');
 SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'b'));
@@ -84,11 +84,11 @@ SELECT is((SELECT amount FROM payments.earnings_ledger WHERE session_id = (SELEC
 SELECT is((SELECT amount FROM payments.credits_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'b')), -5::bigint, 'the user pays 5');
 SELECT payments.end_session((SELECT id FROM s WHERE name = 'b'), 'stopped');
 
--- a run that ends within its first minute still costs a started minute ----------------
+-- a run that ends within its first minute still costs a started minute
 INSERT INTO s SELECT 'c', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000003');
 SELECT is(payments.end_session((SELECT id FROM s WHERE name = 'c'), 'stopped'), 1::bigint, 'a run shorter than a minute is billed one minute');
 
--- stops at a zero balance, the shortfall goes to unpaid ---------------------------------
+-- stops at a zero balance, the shortfall goes to unpaid
 INSERT INTO s SELECT 'd', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', -((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002') - 300));
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'd'), interval '5 minutes');
@@ -116,20 +116,20 @@ SELECT pg_temp.age((SELECT id FROM s WHERE name = 'i'), interval '6 minutes');
 SELECT is(payments.end_stale_sessions(), 1, 'a stale session is ended by the cron function');
 SELECT is((SELECT end_reason::text FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'i')), 'timeout', 'with reason timeout');
 
--- usage is charged every minute ------------------------------------------------------
+-- usage is charged every minute
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 INSERT INTO s SELECT 'h', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'h'), interval '1 minute');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'h')), true, 'a heartbeat one minute in keeps the session running');
 SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 990::bigint, 'and charges that minute');
 
--- the UI check and the session start agree on the minimum balance -------------------
+-- the UI check and the session start agree on the minimum balance
 SELECT is(scripts.can_access('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001'), false, 'below one minute of credits a premium script is not accessible');
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 1);
 SELECT is(scripts.can_access('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001'), true, 'with one minute of credits it is');
 SELECT lives_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001')$$, 'and a session starts');
 
--- a deleted account does not block the cron run --------------------------------------
+-- a deleted account does not block the cron run
 INSERT INTO s SELECT 'k', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000003');
 INSERT INTO s SELECT 'l', * FROM payments.start_session('00000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000003');
 SELECT pg_temp.age((SELECT id FROM s WHERE name IN ('k')), interval '6 minutes');
@@ -138,7 +138,7 @@ DELETE FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000
 SELECT is(payments.end_stale_sessions(), 2, 'a stale session of a deleted user does not stop the others from ending');
 SELECT is((SELECT unpaid FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'k')), 1::bigint, 'and its cost is recorded as unpaid');
 
--- a deleted author: the user is still charged, nobody is paid ---------------------------
+-- a deleted author: the user is still charged, nobody is paid
 INSERT INTO s SELECT 'm', * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000003');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'm'), interval '6 minutes');
 UPDATE payments.accounts SET earnings = 0 WHERE user_id = '00000000-0000-0000-0000-000000000001';
@@ -146,13 +146,13 @@ DELETE FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000
 SELECT is(payments.end_stale_sessions(), 1, 'a stale session of a deleted author ends');
 SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), 9::bigint, 'the user is charged the started minute');
 
--- a folder that is not a uuid is a plain denial, not an error --------------------------
+-- a folder that is not a uuid is a plain denial, not an error
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000004","role":"authenticated"}', true);
 SELECT throws_ok($$INSERT INTO storage.objects (bucket_id, name) VALUES ('imgs', 'scripts/not-a-uuid/cover.webp')$$, '42501', NULL, 'a non-uuid imgs folder is denied by the policy');
 RESET ROLE;
 
--- privileges -----------------------------------------------------------------------------
+-- privileges
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000002","role":"authenticated"}', true);
 SELECT throws_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000003')$$, '42501', NULL, 'authenticated cannot call start_session');

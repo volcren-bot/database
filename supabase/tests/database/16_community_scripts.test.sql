@@ -39,7 +39,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000006', 'grantee');
 -- Clients cannot choose a script id; the tests do, inside this rolled-back transaction, to keep ids readable
 GRANT INSERT ("id") ON TABLE scripts.scripts TO authenticated;
 
--- terms gating -------------------------------------------------------------------------
+-- terms gating
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SELECT throws_ok($$INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-0000-0000-0000-000000000001', 'First', 'd', 'c')$$,
@@ -72,7 +72,7 @@ SELECT pg_temp.act('00000000-0000-0000-0000-000000000004');
 SELECT is((SELECT count(*)::int FROM info.acceptances), 0, 'acceptances are private');
 RESET ROLE;
 
--- a new version of a document asks again, existing scripts keep running ----------------
+-- a new version of a document asks again, existing scripts keep running
 INSERT INTO info.documents (kind, content) VALUES ('community_tos', 'community addendum, second version');
 
 SET LOCAL ROLE authenticated;
@@ -89,7 +89,7 @@ SELECT lives_ok($$INSERT INTO scripts.scripts (id, title, description, content) 
   'accepting the new version unblocks them');
 RESET ROLE;
 
--- the script limit ------------------------------------------------------------------------
+-- the script limit
 UPDATE scripts.config SET max_community_scripts = 2;
 SET LOCAL ROLE authenticated;
 SELECT throws_ok($$INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-0000-0000-0000-000000000003', 'Third', 'd', 'c')$$,
@@ -106,7 +106,7 @@ RESET ROLE;
 SELECT is((SELECT role FROM profiles.profiles WHERE id = '00000000-0000-0000-0000-000000000005'), 'scripter'::profiles.roles, 'a scripter stays a scripter');
 SELECT ok(NOT scripts.author_is_community('20000000-0000-0000-0000-000000000001'), 'a scripter''s script is official');
 
--- deleting scripts -----------------------------------------------------------------------
+-- deleting scripts
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 DELETE FROM scripts.scripts WHERE id = '10000000-0000-0000-0000-000000000002';
@@ -126,7 +126,7 @@ RESET ROLE;
 SELECT is((SELECT role FROM profiles.profiles WHERE id = '00000000-0000-0000-0000-000000000001'), 'user'::profiles.roles, 'losing the last script makes a contributor a user again');
 UPDATE scripts.config SET max_community_scripts = 50;
 
--- community scripts are never premium ----------------------------------------------------
+-- community scripts are never premium
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000001');
 SET LOCAL ROLE authenticated;
 INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-0000-0000-0000-000000000010', 'Community', 'd', 'c');
@@ -135,7 +135,7 @@ SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 5 WHERE
 SELECT lives_ok($$UPDATE scripts.metadata SET stage = 'stable' WHERE id = '10000000-0000-0000-0000-000000000010'$$, 'its stage is only a label');
 RESET ROLE;
 
--- promotion unpublishes, demotion makes scripts free --------------------------------------
+-- promotion unpublishes, demotion makes scripts free
 UPDATE scripts.scripts SET published = true WHERE id = '10000000-0000-0000-0000-000000000010';
 UPDATE profiles.profiles SET role = 'scripter' WHERE id = '00000000-0000-0000-0000-000000000001';
 SELECT is((SELECT published FROM scripts.scripts WHERE id = '10000000-0000-0000-0000-000000000010'), false, 'a promoted contributor''s scripts are unpublished');
@@ -150,8 +150,7 @@ UPDATE profiles.profiles SET role = 'scripter' WHERE id = '00000000-0000-0000-00
 UPDATE profiles.profiles SET role = 'user' WHERE id = '00000000-0000-0000-0000-000000000001';
 SELECT is((SELECT role FROM profiles.profiles WHERE id = '00000000-0000-0000-0000-000000000001'), 'contributor'::profiles.roles, 'a scripter demoted to user with scripts lands on contributor');
 
--- who sees a community script ---------------------------------------------------------
--- (the author is a contributor again, the script is community, stable and published but has no revision)
+-- who sees a community script (author is a contributor again; stable and published but no revision)
 UPDATE scripts.scripts SET published = true WHERE id = '10000000-0000-0000-0000-000000000010';
 -- a code and grant for the grantee (inserted directly: redeeming is tested in 17_share_codes)
 INSERT INTO scripts.share_codes (id, script_id, code_hash, created_by, expires_at, redeemed_by, redeemed_at)
@@ -180,7 +179,7 @@ RESET ROLE;
 UPDATE profiles.profiles SET banned_at = NULL WHERE id = '00000000-0000-0000-0000-000000000001';
 SELECT ok(scripts.can_view('00000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000010'), 'unbanning restores the grant');
 
--- an official script: a grant opens what the stage and published state close ---------------
+-- an official script: a grant opens what the stage and published state close
 UPDATE scripts.metadata SET stage = 'prototype' WHERE id = '20000000-0000-0000-0000-000000000001';
 SELECT ok(NOT scripts.can_view('00000000-0000-0000-0000-000000000006', '20000000-0000-0000-0000-000000000001'), 'a prototype is hidden from a user');
 INSERT INTO scripts.share_codes (id, script_id, code_hash, created_by, expires_at, redeemed_by, redeemed_at)
@@ -201,7 +200,7 @@ SELECT ok(scripts.can_access('00000000-0000-0000-0000-000000000006', '10000000-0
 SELECT ok(scripts.can_access('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000010'), 'so does a tester');
 SELECT ok(NOT scripts.can_access('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000010'), 'a user does not');
 
--- the community storage cap ------------------------------------------------------------------
+-- the community storage cap
 UPDATE profiles.profiles SET role = 'user' WHERE id = '00000000-0000-0000-0000-000000000001';
 DELETE FROM scripts.scripts WHERE id = '10000000-0000-0000-0000-000000000010';
 UPDATE scripts.config SET max_community_bytes = 100;
@@ -254,7 +253,7 @@ SET LOCAL ROLE authenticated;
 SELECT lives_ok($$SELECT scripts.publish_version('20000000-0000-0000-0000-000000000002', 1)$$, 'or fit a cap');
 RESET ROLE;
 
--- tester+ read community files -----------------------------------------------------------------
+-- tester+ read community files
 SET LOCAL ROLE authenticated;
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000002');
 SELECT is((SELECT count(*)::int FROM storage.objects WHERE bucket_id = 'scripts' AND name LIKE '10000000-0000-0000-0000-000000000020/%'), 2, 'a tester reads the files of a community script');

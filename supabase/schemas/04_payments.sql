@@ -1,14 +1,4 @@
--- Schema: payments (new for Volcren; replaces the Stripe schema)
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
---
--- Two append-only ledgers per user, both in credits (1 credit = 0.01 cent EUR, so 1 EUR = 10,000 credits):
---   credits_ledger   spendable balance, topped up through payments and spent per minute of script use (sessions)
---   earnings_ledger  what scripters earned from usage; can be moved into credits (transfer_earnings)
---                    and, later, withdrawn
--- payments.accounts caches both balances. Only the functions below write to it
--- and to the ledgers, and every ledger row stores the balance it resulted in.
--- Ledger and payment rows deliberately have no FK to profiles/scripts: they are
--- financial history and must survive account or script deletion.
+-- Schema payments: append-only credit and earnings ledgers with cached balances
 
 
 CREATE SCHEMA IF NOT EXISTS "payments";
@@ -119,7 +109,7 @@ CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
 );
 
 
--- One row per run of a script, free or premium. No FKs, like the ledgers, so the history survives deletions.
+-- One row per script run, free or premium; no FKs so history survives deletions
 CREATE TABLE IF NOT EXISTS "payments"."sessions" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -186,9 +176,7 @@ CREATE INDEX "earnings_ledger_script_id_idx" ON "payments"."earnings_ledger" USI
 
 -- Functions
 
--- Appends a credits_ledger row and updates the cached balance. A negative
--- amount that would overdraw the account fails on accounts_credits_check.
--- p_actor is the human behind a manual entry (see adjust_credits), null otherwise.
+-- Appends a credits_ledger row and updates the cached balance; overdrawing fails the check
 CREATE OR REPLACE FUNCTION "payments"."post_credits"(
     "p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint,
     "p_payment" "uuid" DEFAULT NULL, "p_script" "uuid" DEFAULT NULL,
@@ -248,8 +236,7 @@ END;
 $$;
 
 
--- Called by the API when the provider (Bitcart webhook) reports a payment as
--- paid. Idempotent: returns false if it was already settled.
+-- Settles a payment reported paid by the provider; false if already settled
 CREATE OR REPLACE FUNCTION "payments"."settle_payment"("p_payment" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -277,8 +264,7 @@ END;
 $$;
 
 
--- Balance a user needs to start or keep running a session at p_price. One formula
--- for scripts.can_access, start_session and heartbeat_session.
+-- Balance needed to start or keep a session at p_price
 CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETURNS bigint
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -286,9 +272,7 @@ CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETUR
   SELECT p_price * min_balance_minutes FROM payments.config;
 $$;
 
--- Average per-minute price of the paid scripts users can run (published, beta or stable, with a
--- live revision), for the credits page's monthly estimate. NULL when there are none. Definer so
--- it sees every such script whatever the caller's role; it only exposes the one number.
+-- Average per-minute price of runnable paid scripts, or NULL; definer so it sees all of them
 CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -304,13 +288,7 @@ CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
     AND m.stage IN ('beta'::scripts.stage, 'stable'::scripts.stage);
 $$;
 
--- Charges a session for p_minutes at the price it started with. Internal: only
--- start/heartbeat/end_session call it, with the session row already locked.
--- Debits up to the available balance and records any shortfall in
--- sessions.unpaid instead of overdrawing (sessions of one user share a balance,
--- so a shortfall can still happen, but it stays below one batch). The author
--- gets floor(charged * (10000 - fee_bps) / 10000), the remainder is the platform's.
--- Returns the credits charged.
+-- Internal: charges p_minutes up to the balance, records any shortfall as unpaid, returns credits charged
 CREATE OR REPLACE FUNCTION "payments"."charge_session"("p_session" "uuid", "p_minutes" integer) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -365,10 +343,7 @@ BEGIN
 END;
 $$;
 
--- Starts a session for the loader (the API calls it with service_role). Fixes
--- the price for the whole session, so later price changes only apply to new
--- sessions, and returns the live revision and its files for the API to hand out
--- as signed URLs.
+-- Starts a session at a fixed price (service_role) and returns the live revision's files
 CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -421,9 +396,7 @@ BEGIN
 END;
 $$;
 
--- Ends a session and charges the started minutes since the last charge, up to
--- last_seen (a run that never got past its first minute still costs one
--- minute). Idempotent. Returns the credits charged.
+-- Ends a session and charges the minutes since the last charge, at least one; idempotent
 CREATE OR REPLACE FUNCTION "payments"."end_session"("p_session" "uuid", "p_reason" "payments"."session_end") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -460,8 +433,7 @@ BEGIN
 END;
 $$;
 
--- Called by the API every 60 seconds while the loader runs. Minutes come from
--- server time, never from the caller. Returns whether the loader may continue.
+-- Loader heartbeat; minutes come from server time; returns whether it may continue
 CREATE OR REPLACE FUNCTION "payments"."heartbeat_session"("p_session" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -507,8 +479,7 @@ BEGIN
 END;
 $$;
 
--- Ends and charges every running session of a user: when they are banned (profiles.set_banned)
--- and before their account is deleted (tr_profiles_pre_delete). Returns how many it ended.
+-- Ends and charges all of a user's running sessions; returns how many
 CREATE OR REPLACE FUNCTION "payments"."end_user_sessions"("p_user" "uuid") RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -529,8 +500,7 @@ BEGIN
 END;
 $$;
 
--- Run every minute by pg_cron (see the cron migration): ends the sessions whose
--- loader stopped sending heartbeats. They are charged up to last_seen.
+-- Ends sessions whose loader stopped heartbeating, charged up to last_seen (pg_cron)
 CREATE OR REPLACE FUNCTION "payments"."end_stale_sessions"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -565,8 +535,7 @@ BEGIN
 END;
 $$;
 
--- Scripters move their earnings into their spendable credits. Withdrawals
--- will be a separate, service_role flow on the earnings ledger.
+-- Moves scripter earnings into spendable credits
 CREATE OR REPLACE FUNCTION "payments"."transfer_earnings"("p_amount" bigint) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -590,9 +559,7 @@ END;
 $$;
 
 
--- Manual change to a balance by an administrator, e.g. a goodwill grant or fixing a mistake.
--- A note is required and the admin is recorded on the ledger row. Called by the API with the
--- service key, which is why the role is checked here and not taken from auth.uid().
+-- Administrator balance adjustment with a required note (service_role, role checked here)
 CREATE OR REPLACE FUNCTION "payments"."adjust_credits"("p_admin" "uuid", "p_user" "uuid", "p_amount" bigint, "p_note" "text") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -639,8 +606,7 @@ END;
 $$;
 
 
--- At most 3 unpaid invoices per user. The lock makes simultaneous inserts line up behind each other.
--- Keep the 3 in sync with MAX_PENDING_PAYMENTS in the webapp.
+-- At most 3 unpaid invoices per user (keep in sync with MAX_PENDING_PAYMENTS in the webapp)
 CREATE OR REPLACE FUNCTION "payments"."tr_payments_limit_pending"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''

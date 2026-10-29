@@ -1,11 +1,4 @@
--- Schema: scripts (rewritten by hand for Volcren)
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
---
--- A script is a set of files (Luau and others) in the `scripts` storage bucket,
--- one folder per revision. Author names/avatars are not copied here: join profiles.profiles.
--- There are no script versions. Official or community is not stored: a script is community while
--- its author's role is below scripter (scripts.author_is_community). Community scripts are
--- visible only to their author, tester+ and people holding a grant from a share code.
+-- Schema scripts: scripts, revisions, grants and share codes; files live in the scripts bucket
 
 
 CREATE SCHEMA IF NOT EXISTS "scripts";
@@ -85,8 +78,7 @@ CREATE TABLE IF NOT EXISTS "scripts"."scripts" (
 );
 
 
--- Every slug a script has had. scripts.url is the current one; the rest redirect to it.
--- A slug is never released, so an old link can't end up pointing at someone else's script.
+-- Every slug a script has had; the current one is scripts.url, old ones redirect and are never released
 CREATE TABLE IF NOT EXISTS "scripts"."slugs" (
     "slug" "text" NOT NULL,
     "id" "uuid" NOT NULL
@@ -120,10 +112,7 @@ COMMENT ON COLUMN "scripts"."protected"."revision" IS 'The live revision. 0 mean
 COMMENT ON COLUMN "scripts"."protected"."last_revision" IS 'Revision allocator. Counts pending and discarded revisions too.';
 
 
--- The file list of a revision, checked by versions_files_check (defined before the table
--- because the CHECK calls it): 1 to 50 unique paths of at most 200 characters, made of
--- letters, digits, _ . - and / between segments, with no "." or ".." segment. The webapp
--- applies the same rules (validFileName in #lib/scripts).
+-- Validates a revision's file list: 1-50 unique safe paths (same rules as validFileName in the webapp)
 CREATE OR REPLACE FUNCTION "scripts"."valid_files"("files" "text"[]) RETURNS boolean
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO ''
@@ -158,8 +147,7 @@ COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One
 
 COMMENT ON COLUMN "scripts"."versions"."sizes" IS 'Byte size of each file in files, in the same order. Required for community authors, who are capped on storage; the real sizes are checked again when the revision goes live (publish_version).';
 
--- The AES-256 key that encrypts the files of one revision (see set_version_key). Only service_role reads it:
--- the API hands it to the loader when a session starts, so the files in the scripts bucket are useless without one.
+-- AES-256 key per revision, readable only by service_role
 CREATE TABLE IF NOT EXISTS "scripts"."version_keys" (
     "id" "uuid" NOT NULL,
     "revision" integer NOT NULL,
@@ -203,8 +191,7 @@ COMMENT ON COLUMN "scripts"."config"."max_share_code_days" IS 'The furthest a sh
 
 COMMENT ON COLUMN "scripts"."config"."redeem_max_failures" IS 'Failed share code redemptions an account gets per redeem_window_minutes before redeem_share_code stops answering.';
 
--- Hashes only, like deploy_tokens: the code is returned once by create_share_code and can't be read
--- back. A code is single-use; redeem_share_code marks it redeemed and adds the grant in one step.
+-- Hashes only; single-use, redeem_share_code marks it used and grants in one step
 CREATE TABLE IF NOT EXISTS "scripts"."share_codes" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "script_id" "uuid" NOT NULL,
@@ -219,8 +206,7 @@ CREATE TABLE IF NOT EXISTS "scripts"."share_codes" (
     CONSTRAINT "share_codes_redeemed_check" CHECK (("redeemed_by" IS NULL) = ("redeemed_at" IS NULL))
 );
 
--- Who may run a script that its rules would otherwise hide from them. A grant bypasses stage,
--- published and archived on official scripts and makes a premium script free for the holder.
+-- Lets a holder run a script its rules would otherwise hide
 CREATE TABLE IF NOT EXISTS "scripts"."grants" (
     "script_id" "uuid" NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -234,8 +220,7 @@ CREATE TABLE IF NOT EXISTS "scripts"."redeem_attempts" (
     "attempted_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
--- Lets CI (GitHub Actions) publish revisions of one script without a user login. Only the
--- SHA-256 of the token is stored; the webapp shows the token once, when it is created.
+-- Lets CI publish revisions of one script; only the token's SHA-256 is stored
 CREATE TABLE IF NOT EXISTS "scripts"."deploy_tokens" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "script_id" "uuid" NOT NULL,
@@ -287,10 +272,7 @@ ALTER TABLE ONLY "scripts"."metadata"
 ALTER TABLE ONLY "scripts"."protected"
     ADD CONSTRAINT "protected_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON UPDATE CASCADE ON DELETE CASCADE;
 
--- A scripter's account can't be deleted while they still author scripts. Admin procedure: reassign the scripts
--- (service_role UPDATE scripts.protected SET author = ...) or delete them (service_role DELETE FROM scripts.scripts,
--- which cascades to metadata, protected, versions and stats; the storage files are removed through the Storage API),
--- then delete the account.
+-- Scripters can't be deleted while they author scripts: reassign or delete the scripts first
 ALTER TABLE ONLY "scripts"."protected"
     ADD CONSTRAINT "protected_author_fkey" FOREIGN KEY ("author") REFERENCES "profiles"."profiles"("id") ON DELETE RESTRICT;
 
@@ -426,8 +408,7 @@ CREATE OR REPLACE FUNCTION "scripts"."min_stage"("script_id" "uuid", "target_sta
 $$;
 
 
--- Community scripts are the ones whose author's role is below scripter. The role decides, so a
--- promotion or demotion changes the tag of every script the author owns.
+-- Community scripts are those whose author's role is below scripter
 CREATE OR REPLACE FUNCTION "scripts"."author_is_community"("script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -465,8 +446,7 @@ CREATE OR REPLACE FUNCTION "scripts"."has_grant"("user_id" "uuid", "script_id" "
 $$;
 
 
--- A community script whose author isn't banned: what tester+ may read the files of (the
--- scripts.versions and scripts bucket SELECT policies)
+-- Community script with an unbanned author, readable by tester+
 CREATE OR REPLACE FUNCTION "scripts"."is_reviewable"("script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -476,8 +456,7 @@ CREATE OR REPLACE FUNCTION "scripts"."is_reviewable"("script_id" "uuid") RETURNS
 $$;
 
 
--- Computed columns for listings: PostgREST selects and filters them like columns of scripts.scripts
--- (select=...,is_community,is_granted). They only describe scripts the caller can already see.
+-- Computed columns for listings, only describing scripts the caller can already see
 CREATE OR REPLACE FUNCTION "scripts"."is_community"("s" "scripts"."scripts") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -505,10 +484,7 @@ CREATE OR REPLACE FUNCTION "scripts"."author_banned"("s" "scripts"."scripts") RE
 $$;
 
 
--- Bytes the author's script files take: for every revision the sizes the objects really have in the
--- scripts bucket. With reserve_pending, a pending revision counts at least its declared sizes, so
--- files it has yet to upload are already reserved (creating a revision); publish_version asks for
--- what is really stored.
+-- Bytes the author's script files take; reserve_pending counts a pending revision at its declared sizes
 CREATE OR REPLACE FUNCTION "scripts"."storage_used"("author_id" "uuid", "reserve_pending" boolean DEFAULT true) RETURNS bigint
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -546,9 +522,7 @@ CREATE OR REPLACE FUNCTION "scripts"."get_community_usage"() RETURNS TABLE ("scr
 $$;
 
 
--- Whether the caller may create a script: scripter+ or any other user, who in either case has to
--- have accepted the current terms, and who isn't banned unless scripter+ (as before). The
--- script limit is enforced by tr_scripts_post_insert, which can serialise concurrent inserts.
+-- Whether the caller may create a script (terms accepted, not banned); the limit is in tr_scripts_post_insert
 CREATE OR REPLACE FUNCTION "scripts"."can_create_script"() RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -562,12 +536,7 @@ $$;
 
 -- Access functions (moved from the profiles schema)
 
--- Premium scripts are open to the author, tester+ and moderator+, and to anyone
--- whose credits cover the minimum balance (payments.required_balance). A script without a live
--- revision can't be run by anyone. The actual charging happens in payments sessions.
--- A community script (author below scripter) is open to its author, tester+ and grantees whatever
--- its stage. A grant also opens an official script past stage, published and archived, and a
--- premium one for free. Nobody below moderator runs a banned author's scripts.
+-- Who may run a script, by role, grant, credits and stage; only moderator+ run a banned author's
 CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -629,9 +598,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("script_id" "uuid") RETURNS bo
 $$;
 
 
--- Who sees a script: moderator+ always, nobody else when its author is banned, then its author and
--- grantees. Community scripts are then visible to tester+ only; official ones follow their stage
--- and published state.
+-- Who sees a script: moderator+, author, grantees, then tester+ (community) or stage/published (official)
 CREATE OR REPLACE FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -663,8 +630,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" 
       ), false);
 $$;
 
--- Author usernames for the scripts in script_ids that the caller can view. Profiles are private,
--- so this is the only way other users see a name, and only a script author's name.
+-- Author usernames for viewable scripts, the only way others see a name
 CREATE OR REPLACE FUNCTION "scripts"."get_authors"("script_ids" "uuid"[]) RETURNS TABLE ("script_id" "uuid", "username" "text")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -680,11 +646,7 @@ $$;
 
 -- Trigger functions
 
--- The slug is the title alone ("auto-fighter") while it is free, and gets the
--- id suffix ("auto-fighter-1a2b3c4d") only on a collision with another script's
--- current or past slug. It follows title changes; scripts.slugs keeps the old
--- ones so their links redirect. Runs as definer because slugs is not readable
--- for scripts the caller can't view, and uniqueness has to see all of them.
+-- Slug is the bare title while free, else suffixed with the id; old slugs are kept for redirects
 CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_set_url"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -733,8 +695,7 @@ END;
 $$;
 
 
--- Runs as definer so authors cannot insert (or forge) the protected/metadata/
--- versions rows themselves.
+-- Definer so authors can't insert or forge the protected, metadata and versions rows
 CREATE OR REPLACE FUNCTION "scripts"."tr_scripts_post_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -790,9 +751,7 @@ END;
 $$;
 
 
--- The webapp creates a revision by inserting a versions row (id + files). The
--- revision number is assigned here, atomically, from the allocator. The row is
--- pending: protected.revision only changes when publish_version makes it live.
+-- Assigns the revision number atomically on insert; the row stays pending until publish_version
 CREATE OR REPLACE FUNCTION "scripts"."tr_versions_pre_insert"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -816,8 +775,7 @@ BEGIN
     RAISE EXCEPTION 'a revision with several files needs an entry file' USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
-  -- A community author declares every file's size, and the revision has to fit what is left of
-  -- their storage. The declared sizes can lie: publish_version checks the real ones.
+  -- A community author declares each file's size; publish_version rechecks the real ones
   IF scripts.author_is_community(NEW.id) THEN
     IF cardinality(NEW.sizes) <> cardinality(NEW.files) THEN
       RAISE EXCEPTION 'every file needs its size' USING ERRCODE = 'check_violation';
@@ -834,10 +792,7 @@ BEGIN
 END;
 $$;
 
--- Upload check for the scripts bucket: the object must be a listed file of the
--- script's pending revision (<id>/<9-digit revision>/<file>), and the user must
--- be its author or moderator+ (the caller, auth.uid(); no one can ask on behalf of
--- another user) and have accepted the current terms. A live or discarded revision can't receive files.
+-- Upload check: a listed file of the pending revision, by its author or moderator+ on the current terms
 CREATE OR REPLACE FUNCTION "scripts"."can_upload"("object_name" "text") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -858,8 +813,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_upload"("object_name" "text") RETURNS 
   );
 $$;
 
--- Read check for the scripts bucket: the author of the script the object belongs to
--- (the first path segment). Moderator+ is checked by the policy.
+-- Read check: the author of the script the object belongs to
 CREATE OR REPLACE FUNCTION "scripts"."is_object_author"("user_id" "uuid", "object_name" "text") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -871,10 +825,7 @@ CREATE OR REPLACE FUNCTION "scripts"."is_object_author"("user_id" "uuid", "objec
   END;
 $$;
 
--- Makes a pending revision live once every listed file exists in the bucket.
--- Moderator+ may publish any script; banned users and users who haven't accepted the current terms
--- can't publish. A community author's storage must fit the cap. service_role is the
--- deploy-token endpoint, which checks the token first (use_deploy_token).
+-- Makes a pending revision live once every file exists; checks ban, terms and the community storage cap
 CREATE OR REPLACE FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -937,10 +888,7 @@ BEGIN
 END;
 $$;
 
--- Stores the key a pending revision's files were encrypted with, given as 64 hex digits. The encrypted file is
--- nonce (12 bytes) || AES-256-GCM ciphertext and tag, authenticated with "volcren:<script id>/<9-digit revision>/<file>",
--- so it is 28 bytes larger than the plain file and only opens under its own name. The key is set once, before the
--- revision goes live. Same callers as publish_version.
+-- Stores a pending revision's AES-256 key (64 hex digits) once; same callers as publish_version
 CREATE OR REPLACE FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -968,8 +916,7 @@ BEGIN
 END;
 $$;
 
--- Pending -> discarded. A service job (API, Storage API) deletes the files of
--- discarded revisions: they must not be deleted through SQL on storage.objects.
+-- Pending -> discarded; a service job deletes the files, never SQL on storage.objects
 CREATE OR REPLACE FUNCTION "scripts"."discard_version"("script_id" "uuid", "revision" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -991,10 +938,7 @@ BEGIN
 END;
 $$;
 
--- Checks a deploy token (by its SHA-256) for a script and records its use. The token
--- only works while whoever made it may still publish the script: its author or moderator+,
--- not banned, and having accepted the current terms.
--- Called by the webapp's deploy endpoint with service_role, before it creates the revision.
+-- Checks a deploy token's hash and records its use (service_role, before creating the revision)
 CREATE OR REPLACE FUNCTION "scripts"."use_deploy_token"("p_script" "uuid", "p_token_hash" "text") RETURNS "uuid"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -1035,11 +979,7 @@ $$;
 
 -- Share codes
 
--- Creates a single-use share code for a script and returns it. This is the only time the code
--- exists in clear: the table keeps its SHA-256, like deploy tokens. Whoever may publish the script
--- (its author, moderator+) can create codes, if not banned and on the current terms. A code
--- expires at p_expires_at, at most max_share_code_days from now, and a script holds at most
--- max_open_share_codes unredeemed, unexpired codes at a time.
+-- Creates a single-use share code and returns it once; only its SHA-256 is stored
 CREATE OR REPLACE FUNCTION "scripts"."create_share_code"("p_script" "uuid", "p_expires_at" timestamp with time zone) RETURNS TABLE ("id" "uuid", "code" "text", "expires_at" timestamp with time zone)
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -1083,17 +1023,7 @@ BEGIN
 END;
 $$;
 
--- Redeems a share code for the caller: checks it and, in one transaction, marks it redeemed and adds
--- the grant, so a code can never work twice, even for concurrent callers (the code's row is
--- locked until the first one commits). Answers with a status instead of raising, because a
--- raised error would roll back the failed attempt that the rate limit counts:
---   ok             the grant was added (script_id and url are set)
---   invalid        no such code, or its script's author is banned
---   expired, used  the code can't be redeemed any more
---   own            the caller wrote the script or made the code
---   already_access the caller can already see the script
---   rate_limited   redeem_max_failures failed attempts in the last redeem_window_minutes
--- invalid, expired and used count as failed attempts; the others leave the code unused.
+-- Redeems a code atomically; returns a status instead of raising so failed attempts count toward the rate limit
 CREATE OR REPLACE FUNCTION "scripts"."redeem_share_code"("p_code" "text") RETURNS TABLE ("status" "text", "script_id" "uuid", "url" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -1170,8 +1100,7 @@ BEGIN
 END;
 $$;
 
--- Who holds a grant on the script, by username (profiles are private, so the owner needs this).
--- For the script's author and moderator+.
+-- Usernames of a script's grantees, for its author and moderator+
 CREATE OR REPLACE FUNCTION "scripts"."list_grantees"("p_script" "uuid") RETURNS TABLE ("user_id" "uuid", "username" "text", "granted_at" timestamp with time zone)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -1185,8 +1114,7 @@ CREATE OR REPLACE FUNCTION "scripts"."list_grantees"("p_script" "uuid") RETURNS 
   ORDER BY g.granted_at;
 $$;
 
--- Run by pg_cron (see the cron migration): drops unredeemed codes once expired, and the failed
--- redemptions that have left every rate limit window
+-- Run by pg_cron: drops expired unredeemed codes and old failed redemptions
 CREATE OR REPLACE FUNCTION "scripts"."delete_expired_share_codes"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -1213,8 +1141,7 @@ CREATE OR REPLACE TRIGGER "tr_scripts_pre_update" BEFORE UPDATE OF "title" ON "s
 
 CREATE OR REPLACE TRIGGER "tr_scripts_record_url" AFTER INSERT ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_record_url"();
 
--- Not "UPDATE OF url": a rename only sets title, and column triggers ignore what BEFORE triggers change.
--- An AFTER trigger's WHEN sees the final row, so this catches the slug tr_scripts_pre_update picked.
+-- Not UPDATE OF url: a rename only sets title, and the AFTER trigger's WHEN sees the final slug
 CREATE OR REPLACE TRIGGER "tr_scripts_record_renamed_url" AFTER UPDATE ON "scripts"."scripts" FOR EACH ROW WHEN (OLD."url" IS DISTINCT FROM NEW."url") EXECUTE FUNCTION "scripts"."tr_scripts_record_url"();
 
 CREATE OR REPLACE TRIGGER "tr_scripts_post_insert" AFTER INSERT ON "scripts"."scripts" FOR EACH ROW EXECUTE FUNCTION "scripts"."tr_scripts_post_insert"();
@@ -1250,28 +1177,24 @@ CREATE POLICY "SELECT for ALLOWED" ON "scripts"."metadata" FOR SELECT USING ("sc
 
 CREATE POLICY "SELECT for ALLOWED" ON "scripts"."protected" FOR SELECT USING ("scripts"."can_view"("profiles"."uid"(), "id"));
 
--- File lists are internal: the API delivers the files. Regular users read the
--- live revision number from protected.revision. Tester+ also review community scripts.
+-- File lists are internal; regular users read only protected.revision
 CREATE POLICY "SELECT for AUTHOR" ON "scripts"."versions" FOR SELECT TO "authenticated"
     USING ("scripts"."is_author"("profiles"."uid"(), "id") OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")
            OR ("profiles"."min_role"("profiles"."uid"(), 'tester'::"profiles"."roles") AND "scripts"."is_reviewable"("id")));
 
 CREATE POLICY "SELECT for EVERYONE" ON "scripts"."bundles" FOR SELECT USING (true);
 
--- Anyone on the current terms creates scripts; below scripter they are community scripts (limits
--- in tr_scripts_post_insert)
+-- Anyone on the current terms creates scripts; limits are in tr_scripts_post_insert
 CREATE POLICY "INSERT for ALLOWED" ON "scripts"."scripts" FOR INSERT TO "authenticated"
     WITH CHECK ("scripts"."can_create_script"());
 
--- Only moderator+ deletes scripts (the cascade takes the rest of the script's rows). The files in the
--- scripts bucket go through the Storage API afterwards, never through SQL.
+-- Only moderator+ deletes scripts; storage files go through the Storage API afterwards
 CREATE POLICY "DELETE for MODERATOR" ON "scripts"."scripts" FOR DELETE TO "authenticated"
     USING ("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles"));
 
 CREATE POLICY "SELECT for EVERYONE" ON "scripts"."config" FOR SELECT USING (true);
 
--- Whoever may publish the script manages its share codes (ids and dates only: the hash is never
--- readable). Only unredeemed codes can be revoked; a redeemed one stays as the record of its grant.
+-- Whoever may publish manages share codes (hash never readable); only unredeemed ones can be revoked
 CREATE POLICY "SELECT for AUTHOR" ON "scripts"."share_codes" FOR SELECT TO "authenticated"
     USING (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
 
@@ -1315,10 +1238,7 @@ CREATE POLICY "INSERT for AUTHOR" ON "scripts"."deploy_tokens" FOR INSERT TO "au
 CREATE POLICY "DELETE for AUTHOR" ON "scripts"."deploy_tokens" FOR DELETE TO "authenticated"
     USING (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
 
--- Grants
--- Authors only touch the content columns. ids, urls, authors and revisions are
--- written by triggers or service_role. A revision's status changes only through
--- publish_version / discard_version. The only client DELETE grant is revoking a deploy token.
+-- Grants: authors write content columns only; revision status changes via publish_version/discard_version
 
 GRANT USAGE ON SCHEMA "scripts" TO "anon";
 GRANT USAGE ON SCHEMA "scripts" TO "authenticated";
@@ -1361,8 +1281,7 @@ GRANT ALL ON TABLE "scripts"."version_keys" TO "service_role";
 REVOKE ALL ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") FROM PUBLIC, "anon";
 GRANT EXECUTE ON FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") TO "authenticated", "service_role";
 
--- Functions are executable by PUBLIC by default; lock down the privileged ones.
--- The policy helpers stay callable by anon because RLS policies call them.
+-- Lock down privileged functions; policy helpers stay callable by anon
 REVOKE ALL ON FUNCTION "scripts"."tr_scripts_set_url"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "scripts"."tr_scripts_record_url"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "scripts"."tr_scripts_post_insert"() FROM PUBLIC, "anon", "authenticated";

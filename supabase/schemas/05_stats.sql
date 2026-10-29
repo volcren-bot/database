@@ -1,15 +1,4 @@
--- Schema: stats (rewritten for Volcren)
---
--- stats.stats       per-user totals, stats.values / stats.values_custom per-script totals,
--- stats.limits(_custom) per-script sanity limits for the reported values,
--- the online counts come from payments.sessions; stats.website(_monthly) download tracking.
--- Rows for a script are created by scripts.tr_scripts_post_insert. Only
--- service_role writes values; authors may edit their script's limits.
---
--- Visibility: only the online counts (online_count, online_per_script) are public.
--- Per-user stats (stats.stats) are readable by the user and moderator+, everything
--- else only by the script's author and moderator+ (totals: service_role only).
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
+-- Schema stats: per-user and per-script totals, limits and online counts
 
 
 CREATE SCHEMA IF NOT EXISTS "stats";
@@ -55,9 +44,7 @@ CREATE OR REPLACE FUNCTION "stats"."increment_user_stats"("user_id" "uuid", "add
 $$;
 
 
--- One report from a running session: checks it against the script's per-minute limits and adds it to the
--- user's totals, the script's totals and the script's custom trackers in a single transaction.
--- A rejected report raises (check_violation) and changes nothing.
+-- Applies one session report to user, script and tracker totals after checking limits; violations raise
 CREATE OR REPLACE FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[] DEFAULT '{}'::bigint[]) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -212,9 +199,7 @@ CREATE OR REPLACE FUNCTION "stats"."can_manage"("script_id" "uuid") RETURNS bool
 $$;
 
 
--- Public online counts, from the open usage sessions (payments.sessions, which is
--- private; these expose numbers only). A session counts as online until its
--- loader has missed heartbeats for session_timeout_minutes.
+-- Public online counts from open sessions (numbers only)
 
 CREATE OR REPLACE FUNCTION "stats"."online_count"() RETURNS bigint
     LANGUAGE "sql" STABLE SECURITY DEFINER
@@ -227,8 +212,7 @@ CREATE OR REPLACE FUNCTION "stats"."online_count"() RETURNS bigint
     AND s.last_seen > now() - make_interval(mins => (SELECT c.session_timeout_minutes FROM payments.config c));
 $$;
 
--- Online sessions per script, only for scripts the caller can view. Counted first so can_view
--- runs once per script, not once per session; MATERIALIZED stops the planner pushing it back down.
+-- Online sessions per viewable script; MATERIALIZED keeps can_view to once per script
 CREATE OR REPLACE FUNCTION "stats"."online_per_script"() RETURNS TABLE ("script_id" "uuid", "users" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''

@@ -1,7 +1,4 @@
--- Schema: public (rewritten for Volcren)
---
--- Only the HMAC helper and the signed webhook function live here.
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
+-- Schema public: HMAC helper and signed webhook function
 
 
 CREATE SCHEMA IF NOT EXISTS "public";
@@ -18,12 +15,7 @@ CREATE OR REPLACE FUNCTION "public"."generate_hmac"("secret_key" "text", "messag
 $$;
 
 
--- Row trigger that POSTs the change to the webapp, signed with an HMAC in
--- X-Supabase-Signature. Both values come from the vault:
---   WEBHOOK_SECRET    HMAC key
---   WEBHOOK_BASE_URL  e.g. https://volcren.com/api/supabase
--- The request goes to <WEBHOOK_BASE_URL>/<schema>/<table>. If either secret is
--- missing the trigger does nothing, so local setups work without the webapp.
+-- Row trigger that POSTs the change to the webapp, HMAC-signed; does nothing without the vault secrets
 CREATE OR REPLACE FUNCTION "public"."webhook"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''

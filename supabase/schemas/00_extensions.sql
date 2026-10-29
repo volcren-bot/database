@@ -1,5 +1,4 @@
--- Extensions the schema relies on, and the pg_cron jobs (the jobs only name functions by string,
--- so they can come before the schemas that define them).
+-- Extensions and pg_cron jobs (jobs name functions by string, so they can precede the schemas)
 CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA pg_catalog;
 
 -- Ends sessions whose loader stopped sending heartbeats

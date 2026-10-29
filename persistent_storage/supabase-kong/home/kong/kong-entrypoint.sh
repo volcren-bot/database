@@ -1,6 +1,5 @@
 #!/bin/bash
-# Custom entrypoint for Kong that builds Lua expressions for request-transformer
-# and performs environment variable substitution in the declarative config.
+# Kong entrypoint: builds Lua expressions for request-transformer and substitutes env vars in the config
 
 if [ -n "$SUPABASE_SECRET_KEY" ] && [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
     export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or (headers.apikey == '$SUPABASE_SECRET_KEY' and 'Bearer $SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and 'Bearer $ANON_KEY_ASYMMETRIC') or headers.apikey)"

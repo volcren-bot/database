@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# A share code must work exactly once, even when many accounts redeem it at the same moment.
-# pgTAP runs in one transaction, so it cannot race; this script opens real parallel sessions
-# against the local database (supabase start) and checks that exactly one redemption wins.
+# Races one share code across parallel sessions on the local database (pgTAP can't); exactly one redemption must win
 # Usage: supabase/tests/concurrency/redeem_race.sh [parallel sessions, default 20]
 set -euo pipefail
 

@@ -1,9 +1,4 @@
--- Schema: profiles (rewritten by hand for Volcren)
--- Apply order: public -> profiles -> scripts -> payments -> stats -> info (scripts.can_access reads payments.accounts at call time)
---
--- Profiles are keyed by auth.users.id. No emails, Stripe IDs or Discord IDs are
--- stored here: provider IDs are read from auth.identities (get_provider_id /
--- get_user_id), and OAuth emails are scrubbed by triggers on the auth tables.
+-- Schema profiles: keyed by auth.users.id, no emails or provider IDs stored
 
 
 CREATE SCHEMA IF NOT EXISTS "profiles";
@@ -57,9 +52,7 @@ ALTER TABLE ONLY "profiles"."profiles"
 ALTER TABLE ONLY "profiles"."profiles"
     ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
--- Append-only record of administrators logging in as other users (the admin page's
--- impersonate action), written by log_impersonation. No FKs on purpose, like the
--- payments ledgers: the record outlives both accounts.
+-- Append-only log of admin impersonations, no FKs so it outlives both accounts
 CREATE TABLE IF NOT EXISTS "profiles"."impersonations" (
     "id" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
     "admin_id" "uuid" NOT NULL,
@@ -70,8 +63,7 @@ CREATE TABLE IF NOT EXISTS "profiles"."impersonations" (
 ALTER TABLE ONLY "profiles"."impersonations"
     ADD CONSTRAINT "impersonations_pkey" PRIMARY KEY ("id");
 
--- Append-only record of every ban and unban (banned = false), written by set_banned.
--- No FKs, like impersonations.
+-- Append-only log of bans and unbans, no FKs
 CREATE TABLE IF NOT EXISTS "profiles"."bans" (
     "id" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
     "admin_id" "uuid" NOT NULL,
@@ -144,7 +136,7 @@ CREATE OR REPLACE FUNCTION "profiles"."is_banned"("user_id" "uuid") RETURNS bool
 $$;
 
 
--- Provider IDs (the Discord ID) are private: only the user themselves, moderator+ and service_role get them.
+-- Provider IDs are private: the user, moderator+ and service_role only
 CREATE OR REPLACE FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") RETURNS "text"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -172,13 +164,7 @@ CREATE OR REPLACE FUNCTION "profiles"."get_user_id"("provider" "text", "provider
 $$;
 
 
--- Sign-up pipeline
---
--- Caveats of the email scrubbing below:
---  * The first JWT issued during an OAuth sign-up, and possibly
---    auth.audit_log_entries.actor_username, can still contain the real email.
---  * Discord is the only login method, so every user gets the synthetic
---    <id>@volcren.com address.
+-- Sign-up pipeline; the first OAuth JWT and audit log can still hold the real email
 
 -- Cleans a provider-supplied name so it satisfies profiles_username_check
 CREATE OR REPLACE FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") RETURNS "text"
@@ -275,8 +261,7 @@ END;
 $$;
 
 
--- Second line of defence for Discord-only login: reject any other provider
--- if email or phone sign-up is ever switched on by mistake.
+-- Rejects any provider but Discord in case email or phone sign-up is switched on
 CREATE OR REPLACE FUNCTION "profiles"."require_discord"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
@@ -291,9 +276,7 @@ $$;
 
 CREATE OR REPLACE TRIGGER "profiles_require_discord" BEFORE INSERT ON "auth"."users" FOR EACH ROW EXECUTE FUNCTION "profiles"."require_discord"();
 
--- Records an impersonation; the webapp calls it (service_role) before creating the
--- login, so an impersonation that can't be recorded doesn't happen. Administrators
--- can't impersonate each other.
+-- Logs an admin impersonation before the login is created; admins can't impersonate each other
 CREATE OR REPLACE FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -316,11 +299,7 @@ BEGIN
 END;
 $$;
 
--- Bans or unbans an account; the admin page calls it (service_role), then mirrors the state
--- to Auth (ban_duration) so a banned user can't sign in or refresh a session either. A ban
--- ends the user's running scripts, and banned users can't start scripts or publish revisions
--- (start_session, publish_version, use_deploy_token). Administrators can't be banned.
--- Returns false, recording nothing, when the account is already in that state.
+-- Bans or unbans an account (service_role), ending its sessions; false if already in that state
 CREATE OR REPLACE FUNCTION "profiles"."set_banned"("p_admin" "uuid", "p_user" "uuid", "p_banned" boolean, "p_reason" "text") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -364,10 +343,7 @@ BEGIN
 END;
 $$;
 
--- Whether the user accepted the current scripter_tos and community_tos (info.acceptances). A kind
--- nobody has published yet asks nothing of scripter+ (existing scripters keep working until a
--- version appears), but community authors can't pass until both exist. Only answers for the caller
--- or service_role.
+-- Whether the caller (or service_role) accepted the current scripter_tos and community_tos
 CREATE OR REPLACE FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -392,11 +368,7 @@ CREATE OR REPLACE FUNCTION "profiles"."has_accepted_terms"("user_id" "uuid") RET
     ), false);
 $$;
 
--- Keeps scripts and the contributor role in line with a role change. A scripter+ publishes what they
--- make, so a contributor promoted to scripter has their scripts unpublished until they publish them
--- again (grants keep working). Below scripter their scripts are community scripts, which are never
--- premium, so a demotion makes them free. A scripter demoted straight to user who still authors
--- scripts lands on contributor.
+-- Keeps scripts and the contributor role in line with a role change
 CREATE OR REPLACE FUNCTION "profiles"."tr_profiles_role_change"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -454,8 +426,7 @@ CREATE OR REPLACE TRIGGER "profiles_scrub_identity_email" BEFORE INSERT OR UPDAT
 
 ALTER TABLE "profiles"."profiles" ENABLE ROW LEVEL SECURITY;
 
--- Profiles are private: only the owner and moderator+ read them. The one public part,
--- the usernames of script authors, goes through scripts.get_authors.
+-- Profiles are private: owner and moderator+ only; author names go through scripts.get_authors
 CREATE POLICY "SELECT for OWNER and MODERATOR" ON "profiles"."profiles" FOR SELECT TO "authenticated"
     USING ((("id" = ( SELECT "auth"."uid"() AS "uid")) OR "profiles"."min_role"(( SELECT "auth"."uid"() AS "uid"), 'moderator'::"profiles"."roles")));
 
@@ -487,8 +458,7 @@ GRANT SELECT ON TABLE "profiles"."impersonations" TO "service_role";
 REVOKE ALL ON TABLE "profiles"."bans" FROM "anon", "authenticated", "service_role";
 GRANT SELECT ON TABLE "profiles"."bans" TO "service_role";
 
--- Functions are executable by PUBLIC by default; lock down the privileged ones.
--- Revoking PUBLIC also drops anon, so the policy helpers are re-granted below.
+-- Lock down privileged functions; policy helpers are re-granted to anon below
 REVOKE ALL ON FUNCTION "profiles"."handle_new_user"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."require_discord"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "profiles"."scrub_user_email"() FROM PUBLIC, "anon", "authenticated";
@@ -513,7 +483,7 @@ GRANT EXECUTE ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid"
 GRANT EXECUTE ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_user_id"("provider" "text", "provider_id" "text") TO "service_role";
 GRANT EXECUTE ON FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") TO "authenticated", "service_role";
--- Only policies TO authenticated call these (anyone who could execute them could learn a user's role from an ID).
+-- Authenticated-only: exposing these would let anyone look up a user's role by ID
 REVOKE ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "profiles"."min_role"("user_id" "uuid", "target_role" "profiles"."roles") FROM PUBLIC, "anon";
 GRANT EXECUTE ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") TO "authenticated", "service_role";

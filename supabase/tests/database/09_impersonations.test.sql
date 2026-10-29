@@ -17,7 +17,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'admin2', 'adminis
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'mod', 'moderator');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'user');
 
--- who can impersonate whom -------------------------------------------------------------
+-- who can impersonate whom
 SELECT lives_ok($$SELECT profiles.log_impersonation('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000004')$$,
   'an administrator can impersonate a user');
 SELECT lives_ok($$SELECT profiles.log_impersonation('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003')$$,
@@ -40,7 +40,7 @@ SELECT throws_ok($$SELECT profiles.log_impersonation('00000000-0000-0000-0000-00
   'P0002', NULL, 'an unknown user cannot be impersonated');
 SELECT is((SELECT count(*)::int FROM profiles.impersonations), 2, 'refused impersonations are not recorded');
 
--- the record is append-only and private -------------------------------------------------
+-- the record is append-only and private
 SELECT throws_like($$DELETE FROM profiles.impersonations$$, '%append-only%', 'records cannot be deleted');
 SELECT throws_like($$UPDATE profiles.impersonations SET user_id = admin_id$$, '%append-only%', 'or changed');
 
