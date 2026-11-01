@@ -807,8 +807,7 @@ BEGIN
   NEW.status := 'pending';
   NEW.published_at := NULL;
 
-  -- A community author declares every file's size, and the revision has to fit what is left of
-  -- their storage. The declared sizes can lie: publish_version checks the real ones.
+  -- A community author declares every file's size, which must fit their remaining storage; publish_version checks the real ones.
   IF scripts.author_is_community(NEW.id) THEN
     IF cardinality(NEW.sizes) <> cardinality(NEW.files) THEN
       RAISE EXCEPTION 'every file needs its size' USING ERRCODE = 'check_violation';
@@ -1053,8 +1052,7 @@ GRANT DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON
 
 GRANT DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON TABLE "scripts"."redeem_attempts" TO "postgres", "service_role";
 
--- Only DELETE is new. (The generated REVOKE ALL / GRANT DELETE, SELECT pair would also have dropped
--- the column grants authors use to insert and update their scripts.)
+-- Only DELETE is new; the generated REVOKE ALL / GRANT pair would have dropped the authors' column grants.
 GRANT DELETE ON TABLE "scripts"."scripts" TO "authenticated";
 
 GRANT SELECT ("created_at") ON TABLE "scripts"."share_codes" TO "authenticated";
@@ -1085,8 +1083,7 @@ GRANT SELECT ("created_by") ON TABLE "scripts"."share_codes" TO "authenticated";
 -- The community limits; the table holds this one row and nothing else
 INSERT INTO "scripts"."config" ("id") VALUES (true);
 
--- Existing scripter+ keep working: they accepted the current scripter_tos on the old, untracked
--- terms. A community_tos published later (or a new scripter_tos) asks everyone again.
+-- Existing scripter+ keep working on the old terms, and a later community_tos or new scripter_tos asks everyone again.
 INSERT INTO "info"."acceptances" ("user_id", "kind", "version")
 SELECT p."id", d."kind", d."version"
 FROM "profiles"."profiles" p
@@ -1097,6 +1094,5 @@ CROSS JOIN LATERAL (
 ) d
 WHERE p."role" >= 'scripter'::"profiles"."roles";
 
--- Drops share codes that expired unredeemed, and old failed redemptions. cron.schedule with a name
--- replaces an existing job of that name.
+-- Drops share codes that expired unredeemed and old failed redemptions; cron.schedule with a name replaces an existing job.
 SELECT cron.schedule('scripts-delete-expired-share-codes', '17 * * * *', $$SELECT scripts.delete_expired_share_codes()$$);

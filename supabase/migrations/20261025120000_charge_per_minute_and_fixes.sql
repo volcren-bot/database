@@ -1,8 +1,4 @@
--- Charge every minute: the heartbeat charges each elapsed minute, so payments.config.batch_minutes
--- is gone and min_balance_batches becomes min_balance_minutes. One formula for the minimum balance
--- (payments.required_balance) is used by scripts.can_access, start_session and heartbeat_session.
--- Also: deleted accounts no longer break charging, end_stale_sessions isolates and re-checks each
--- session, can_upload uses auth.uid(), and the imgs policies no longer error on a non-uuid folder.
+-- Charge every minute: payments.config.batch_minutes is gone, min_balance_batches becomes min_balance_minutes, plus several charging and policy fixes.
 
 ALTER TABLE payments.config DROP CONSTRAINT config_batch_check;
 ALTER TABLE payments.config DROP COLUMN batch_minutes;

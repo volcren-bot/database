@@ -1,9 +1,4 @@
--- Security advisor fixes.
---
--- 1. Public buckets serve objects by URL without any SELECT policy; the policies only let clients list every file.
---    The writes all go through service_role, which bypasses RLS.
--- 2. anon no longer executes helpers that only authenticated policies or the service_role API need. The versions
---    SELECT policy had no TO clause, so it was evaluated for anon and would now fail with a permission error.
+-- Security advisor fixes: drop SELECT policies that only allowed listing public buckets, and stop anon executing authenticated-only helpers.
 DROP POLICY IF EXISTS "assets SELECT for everyone" ON "storage"."objects";
 DROP POLICY IF EXISTS "client SELECT for everyone" ON "storage"."objects";
 DROP POLICY IF EXISTS "imgs SELECT for everyone" ON "storage"."objects";

@@ -1,5 +1,4 @@
--- Slugs follow title changes and only carry the id suffix on a collision.
--- scripts.slugs remembers every slug a script has had so old links redirect.
+-- Slugs follow title changes and only carry the id suffix on a collision; scripts.slugs remembers old ones so links redirect.
 
 CREATE TABLE IF NOT EXISTS "scripts"."slugs" (
     "slug" "text" NOT NULL,

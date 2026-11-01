@@ -1,7 +1,4 @@
--- Hand-written: the `launcher` bucket becomes `client` (loader releases). Supabase can't rename a bucket, so create the
--- new one and move its policies. The row is inserted here for local resets; in production create it in the dashboard
--- first (public) and this insert is skipped. Empty and delete the old `launcher` bucket in the dashboard afterwards:
--- storage refuses to delete a bucket with SQL.
+-- Hand-written: the `launcher` bucket becomes `client`, since Supabase can't rename one; empty and delete the old bucket in the dashboard.
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types) VALUES
     ('client', 'client', true, NULL, NULL)
 ON CONFLICT (id) DO NOTHING;

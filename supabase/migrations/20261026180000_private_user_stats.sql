@@ -1,5 +1,4 @@
--- Per-user stats go private: each user's experience, gold, runtime and level totals were readable
--- by everyone, now only by the user and moderator+. Nothing in the webapp read other users' stats.
+-- Per-user stats go private: readable only by the user and moderator+, since nothing in the webapp read other users' stats.
 
 DROP POLICY IF EXISTS "SELECT for EVERYONE" ON "stats"."stats";
 

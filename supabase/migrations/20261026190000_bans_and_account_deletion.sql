@@ -1,13 +1,4 @@
--- Bans and self-service account deletion.
---
--- Bans: administrators ban and unban accounts from the admin page (profiles.set_banned, which
--- records every change in profiles.bans). A banned account's running scripts end, and it can't
--- start scripts or publish revisions, through the site or a deploy token. The webapp also sets
--- the Auth ban, which blocks sign-in and session refresh.
---
--- Deletion: users delete their own account from the account page (the webapp deletes the auth
--- user). Before the profile goes, its running scripts are ended and charged while the balance
--- still exists (tr_profiles_pre_delete).
+-- Bans and self-service account deletion: profiles.set_banned records bans, and deleting ends and charges running scripts first.
 
 ALTER TABLE "profiles"."profiles" ADD COLUMN "banned_at" timestamp with time zone;
 

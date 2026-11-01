@@ -1,6 +1,4 @@
--- Profiles go private: usernames, avatars and roles were readable by everyone, now only by the
--- owner and moderator+. The webapp only showed other people's names as script authors, so those
--- move to scripts.get_authors, which returns the author's username for scripts the caller can view.
+-- Profiles go private: usernames, avatars and roles are readable only by the owner and moderator+, and author names move to scripts.get_authors.
 
 DROP POLICY IF EXISTS "SELECT for EVERYONE" ON "profiles"."profiles";
 

@@ -1,7 +1,4 @@
--- Deploy tokens: CI (GitHub Actions) publishes revisions of one script through the webapp's
--- /api/scripts/<id>/revisions endpoint instead of signing in with a password. The endpoint checks
--- the token with use_deploy_token and then works as service_role, so publish_version and
--- discard_version now accept service_role too.
+-- Deploy tokens: CI publishes revisions through the webapp's revisions endpoint, which checks the token and then works as service_role.
 
 CREATE TABLE "scripts"."deploy_tokens" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,

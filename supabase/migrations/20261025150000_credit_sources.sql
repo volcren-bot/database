@@ -1,7 +1,4 @@
--- Record where credits come from: payments.bonus splits the top-up bonus out of payments.credits,
--- and credits_ledger.granted_by records the administrator behind a manual entry. Manual changes go
--- through the new payments.adjust_credits. post_credits gains a trailing p_actor parameter, so the
--- old signature is dropped and its privileges are granted again.
+-- Record where credits come from: payments.bonus, credits_ledger.granted_by, a new payments.adjust_credits, and post_credits gains a p_actor parameter.
 
 ALTER TABLE "payments"."payments" ADD COLUMN "bonus" bigint DEFAULT 0 NOT NULL;
 ALTER TABLE "payments"."payments" ADD CONSTRAINT "payments_bonus_check" CHECK ("bonus" >= 0 AND "bonus" < "credits");
@@ -12,9 +9,7 @@ ALTER TABLE "payments"."credits_ledger" ADD COLUMN "granted_by" "uuid";
 
 DROP FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid");
 
--- Appends a credits_ledger row and updates the cached balance. A negative
--- amount that would overdraw the account fails on accounts_credits_check.
--- p_actor is the human behind a manual entry (see adjust_credits), null otherwise.
+-- Appends a credits_ledger row and updates the cached balance; p_actor is the human behind a manual entry, null otherwise.
 CREATE OR REPLACE FUNCTION "payments"."post_credits"(
     "p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint,
     "p_payment" "uuid" DEFAULT NULL, "p_script" "uuid" DEFAULT NULL,
@@ -44,9 +39,7 @@ BEGIN
 END;
 $$;
 
--- Manual change to a balance by an administrator, e.g. a goodwill grant or fixing a mistake.
--- A note is required and the admin is recorded on the ledger row. Called by the API with the
--- service key, which is why the role is checked here and not taken from auth.uid().
+-- Manual change to a balance by an administrator with a required note; the role is checked here because the API uses the service key.
 CREATE OR REPLACE FUNCTION "payments"."adjust_credits"("p_admin" "uuid", "p_user" "uuid", "p_amount" bigint, "p_note" "text") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''

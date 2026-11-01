@@ -1,10 +1,4 @@
--- Three hardening changes:
---  1. Script prices are capped at 22 credits a minute (about 98 EUR for a 31-day month of
---     nonstop use) instead of 10,000. Prices above the new cap are lowered to it.
---  2. Admin impersonations are recorded in the append-only profiles.impersonations, and
---     administrators can no longer impersonate each other (profiles.log_impersonation).
---  3. versions.files is checked in the database (count, uniqueness, allowed characters, no
---     "." or ".." segments) instead of only in the browser.
+-- Three hardening changes: a script price cap, recorded admin impersonations, and database-side checks of versions.files.
 
 -- 1. price cap --------------------------------------------------------------------------
 
@@ -71,10 +65,7 @@ REVOKE ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user"
 REVOKE ALL ON FUNCTION "profiles"."tr_impersonations_immutable"() FROM PUBLIC, "anon", "authenticated";
 GRANT EXECUTE ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") TO "service_role";
 
--- 3. revision file names ----------------------------------------------------------------
--- Fails if an existing revision breaks the new rules; find those with:
---   select id, revision, files from scripts.versions where not scripts.valid_files(files);
--- (run after creating the function below, or inside a transaction you roll back).
+-- 3. revision file names ---- Fails if an existing revision breaks the new rules; find them with scripts.valid_files(files).
 
 CREATE OR REPLACE FUNCTION "scripts"."valid_files"("files" "text"[]) RETURNS boolean
     LANGUAGE "sql" IMMUTABLE

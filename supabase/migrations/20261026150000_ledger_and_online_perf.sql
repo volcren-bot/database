@@ -1,8 +1,4 @@
--- Two query-cost fixes, no behaviour change:
---  1. The admin page's "kind = 'adjustment'" listing scanned the whole credits ledger, which
---     grows by a usage row per paid minute. A partial index over the rare adjustments serves it.
---  2. stats.online_per_script ran scripts.can_view once per open session. It now counts per
---     script first and checks visibility once per script.
+-- Two query-cost fixes, no behaviour change: a partial index for adjustments and a per-script visibility check in stats.online_per_script.
 
 -- 1. adjustments index ------------------------------------------------------------------
 

@@ -1,6 +1,4 @@
--- A user can have at most 3 unpaid invoices at once, so the checkout form can't be used to flood
--- Bitcart. The webapp checks first and reuses an open invoice; this is the backstop for
--- simultaneous requests.
+-- A user can have at most 3 unpaid invoices at once, so checkout can't flood Bitcart; this is the backstop for simultaneous requests.
 
 CREATE OR REPLACE FUNCTION "payments"."tr_payments_limit_pending"() RETURNS "trigger"
     LANGUAGE "plpgsql"

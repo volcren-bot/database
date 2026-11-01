@@ -1,7 +1,4 @@
--- payments.average_price: the credits page's monthly estimate used to fetch every paid, published
--- script's price with the service-role key and average them in the webapp. The database now returns
--- the one number to the logged-in user, and only counts scripts users can run (beta or stable, with
--- a live revision), not prototypes, archived scripts or ones without a revision yet.
+-- payments.average_price: the database now returns the monthly estimate's average to the logged-in user, over runnable scripts only.
 
 CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
     LANGUAGE "sql" STABLE SECURITY DEFINER

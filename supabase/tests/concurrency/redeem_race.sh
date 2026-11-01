@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Races one share code across parallel sessions on the local database (pgTAP can't); exactly one redemption must win
-# Usage: supabase/tests/concurrency/redeem_race.sh [parallel sessions, default 20]
+# Races one share code across parallel sessions (pgTAP can't); usage: redeem_race.sh [parallel sessions, default 20].
 set -euo pipefail
 
 DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:54322/postgres}"

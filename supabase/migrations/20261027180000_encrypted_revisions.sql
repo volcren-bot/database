@@ -1,10 +1,6 @@
--- Every revision is stored encrypted. The files of a revision are AES-256-GCM encrypted by whoever uploads them
--- (the webapp's browser upload and its deploy-token endpoint) under a random key, which goes to scripts.version_keys
--- through set_version_key. The API gives the key to the loader when a session starts, and the loader decrypts in
--- memory. publish_version refuses a revision with no key; revisions published before this stay plain and have no key.
+-- Every revision is stored AES-256-GCM encrypted under a random key set via set_version_key, and the loader decrypts in memory.
 
--- The AES-256 key that encrypts the files of one revision (see set_version_key). Only service_role reads it:
--- the API hands it to the loader when a session starts, so the files in the scripts bucket are useless without one.
+-- The AES-256 key for one revision's files, readable only by service_role and handed to the loader when a session starts.
 CREATE TABLE IF NOT EXISTS "scripts"."version_keys" (
     "id" "uuid" NOT NULL,
     "revision" integer NOT NULL,
@@ -19,10 +15,7 @@ ALTER TABLE ONLY "scripts"."version_keys"
 ALTER TABLE ONLY "scripts"."version_keys"
     ADD CONSTRAINT "version_keys_version_fkey" FOREIGN KEY ("id", "revision") REFERENCES "scripts"."versions"("id", "revision") ON UPDATE CASCADE ON DELETE CASCADE;
 
--- Stores the key a pending revision's files were encrypted with, given as 64 hex digits. The encrypted file is
--- nonce (12 bytes) || AES-256-GCM ciphertext and tag, authenticated with "volcren:<script id>/<9-digit revision>/<file>",
--- so it is 28 bytes larger than the plain file and only opens under its own name. The key is set once, before the
--- revision goes live. Same callers as publish_version.
+-- Stores the 64-hex-digit key a pending revision was encrypted with (nonce || ciphertext and tag, bound to its own path); set once before going live.
 CREATE OR REPLACE FUNCTION "scripts"."set_version_key"("script_id" "uuid", "revision" integer, "key" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''

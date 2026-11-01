@@ -1,6 +1,4 @@
--- Each revision names the file the loader runs (scripts.versions.entry), so scripts no longer have to
--- be called main.luau. Existing revisions keep running: main.luau if they have one, else their first file.
--- A new revision of one file uses it as the entry; with several files the uploader names it.
+-- Each revision names the file the loader runs (scripts.versions.entry); existing ones default to main.luau or their first file.
 
 ALTER TABLE "scripts"."versions" ADD COLUMN "entry" text;
 
@@ -37,8 +35,7 @@ BEGIN
     RAISE EXCEPTION 'a revision with several files needs an entry file' USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
-  -- A community author declares every file's size, and the revision has to fit what is left of
-  -- their storage. The declared sizes can lie: publish_version checks the real ones.
+  -- A community author declares every file's size, which must fit their remaining storage; publish_version checks the real ones.
   IF scripts.author_is_community(NEW.id) THEN
     IF cardinality(NEW.sizes) <> cardinality(NEW.files) THEN
       RAISE EXCEPTION 'every file needs its size' USING ERRCODE = 'check_violation';

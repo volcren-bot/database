@@ -1,12 +1,6 @@
--- stats.report_session: one entry point for the stats a running session reports.
---
--- It validates the report against the script's per-minute limits (stats.limits and stats.limits_custom) and adds
--- it to the user's totals, the script's totals and the script's custom trackers in one transaction, so a rejected
--- report changes nothing. Until now the API did this with two separate calls and could not store custom trackers.
+-- stats.report_session: one entry point that validates a report against the per-minute limits and adds it to all totals in one transaction.
 
--- One report from a running session: checks it against the script's per-minute limits and adds it to the
--- user's totals, the script's totals and the script's custom trackers in a single transaction.
--- A rejected report raises (check_violation) and changes nothing.
+-- One report from a running session, checked against per-minute limits and added in one transaction; a rejected report raises and changes nothing.
 CREATE OR REPLACE FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[] DEFAULT '{}'::bigint[]) RETURNS "void"
     LANGUAGE "plpgsql"
     SET "search_path" TO ''
