@@ -9,3 +9,6 @@ SELECT cron.schedule('scripts-delete-expired-share-codes', '17 * * * *', $$SELEC
 
 -- stats.totals is not refreshed automatically
 SELECT cron.schedule('stats-refresh-totals', '*/10 * * * *', $$REFRESH MATERIALIZED VIEW stats.totals$$);
+
+-- Bug report attachments are kept for 90 days
+SELECT cron.schedule('feedback-clear-old-attachments', '23 3 * * *', $$SELECT feedback.clear_old_attachments()$$);

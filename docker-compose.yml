@@ -68,7 +68,7 @@ services:
       - 'POSTGRES_HOST=${POSTGRES_HOST:-supabase-db}'
       - 'POSTGRES_PORT=${POSTGRES_PORT:-5432}'
       - 'POSTGRES_DB=${POSTGRES_DB:-postgres}'
-      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public,profiles}'
+      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public,profiles,payments,scripts,stats,info,feedback}'
       - 'PGRST_DB_MAX_ROWS=${PGRST_DB_MAX_ROWS:-1000}'
       - 'PGRST_DB_EXTRA_SEARCH_PATH=${PGRST_DB_EXTRA_SEARCH_PATH:-public}'
       - 'DEFAULT_ORGANIZATION_NAME=${STUDIO_DEFAULT_ORGANIZATION:-Default Organization}'
@@ -212,7 +212,7 @@ services:
         condition: service_healthy
     environment:
       - 'PGRST_DB_URI=postgres://authenticator:${SERVICE_PASSWORD_POSTGRES}@${POSTGRES_HOSTNAME:-supabase-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}'
-      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public,profiles}'
+      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public,profiles,payments,scripts,stats,info,feedback}'
       - 'PGRST_DB_MAX_ROWS=${PGRST_DB_MAX_ROWS:-1000}'
       - 'PGRST_DB_EXTRA_SEARCH_PATH=${PGRST_DB_EXTRA_SEARCH_PATH:-public}'
       - PGRST_DB_ANON_ROLE=anon

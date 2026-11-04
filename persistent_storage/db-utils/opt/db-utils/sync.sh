@@ -53,7 +53,7 @@ echo "Dumping schemas and storage policies..."
 	echo "-- Live database snapshot, generated nightly by the sync task. Do not edit:"
 	echo "-- the source of truth is supabase/schemas/ and supabase/migrations/."
 	echo
-	dump 'public|profiles|scripts|stats|payments|info'
+	dump 'public|profiles|scripts|stats|payments|info|feedback'
 	echo
 	echo "-- RLS policies for Supabase's storage schema (extracted from a full storage dump)."
 	echo
