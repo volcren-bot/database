@@ -51,7 +51,7 @@ SELECT throws_ok($$SELECT profiles.set_banned('00000000-0000-0000-0000-000000000
 SELECT is((SELECT count(*)::int FROM profiles.bans), 0, 'refused bans are not recorded');
 
 -- a ban ends running scripts
-CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text);
+CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 UPDATE payments.sessions SET started_at = started_at - interval '3 minutes', charged_until = charged_until - interval '3 minutes';
 

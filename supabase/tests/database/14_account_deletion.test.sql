@@ -35,7 +35,7 @@ SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-000
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 
 -- deleting a user ends and charges their running scripts
-CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text);
+CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 UPDATE payments.sessions SET started_at = started_at - interval '3 minutes', charged_until = charged_until - interval '3 minutes';
 

@@ -49,6 +49,9 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000005', 'stranger');
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001');
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001');
 
+-- the runner's extra instances need a credit of balance for the fee
+SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 100);
+SELECT payments.post_credits('00000000-0000-0000-0000-000000000005', 'adjustment', 100);
 CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid);
 INSERT INTO s SELECT 'open', session_id FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 INSERT INTO s SELECT 'ended', session_id FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');

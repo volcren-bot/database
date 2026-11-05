@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS "payments"."config" (
     "platform_fee_bps" integer DEFAULT 2000 NOT NULL,
     "session_timeout_minutes" integer DEFAULT 5 NOT NULL,
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
+    "extra_session_fee" bigint DEFAULT 30000 NOT NULL,
     CONSTRAINT "config_singleton" CHECK ("id"),
+    CONSTRAINT "config_extra_session_fee_check" CHECK ("extra_session_fee" >= 0),
     CONSTRAINT "config_fee_check" CHECK ("platform_fee_bps" BETWEEN 0 AND 10000),
     CONSTRAINT "config_check" CHECK ("session_timeout_minutes" > 0 AND "min_balance_minutes" > 0)
 );
@@ -41,14 +43,20 @@ COMMENT ON COLUMN "payments"."config"."session_timeout_minutes" IS 'A session wi
 
 COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs a balance covering this many minutes at its price to start and to keep running (see payments.required_balance).';
 
+COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Credits every extra concurrent session of an account costs per 30 days of running (30000 = 1 EUR x 3). The oldest open session is free, and tester+ pay no fee.';
+
 CREATE TABLE IF NOT EXISTS "payments"."accounts" (
     "user_id" "uuid" NOT NULL,
     "credits" bigint DEFAULT 0 NOT NULL,
     "earnings" bigint DEFAULT 0 NOT NULL,
+    "bonus_credits" bigint DEFAULT 0 NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     CONSTRAINT "accounts_credits_check" CHECK ("credits" >= 0),
-    CONSTRAINT "accounts_earnings_check" CHECK ("earnings" >= 0)
+    CONSTRAINT "accounts_earnings_check" CHECK ("earnings" >= 0),
+    CONSTRAINT "accounts_bonus_credits_check" CHECK ("bonus_credits" >= 0 AND "bonus_credits" <= "credits")
 );
+
+COMMENT ON COLUMN "payments"."accounts"."bonus_credits" IS 'The part of credits that came from top-up bonuses. Spent in the same proportion as the balance holds it, and the author''s share on that part is not paid out.';
 
 
 CREATE TABLE IF NOT EXISTS "payments"."payments" (
@@ -89,9 +97,17 @@ CREATE TABLE IF NOT EXISTS "payments"."credits_ledger" (
     "minutes" integer,
     "note" "text",
     "granted_by" "uuid",
+    "fee" bigint DEFAULT 0 NOT NULL,
+    "bonus" bigint DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "credits_ledger_amount_check" CHECK ("amount" <> 0)
+    CONSTRAINT "credits_ledger_amount_check" CHECK ("amount" <> 0),
+    CONSTRAINT "credits_ledger_fee_check" CHECK ("fee" >= 0 AND ("fee" = 0 OR "fee" <= -"amount")),
+    CONSTRAINT "credits_ledger_bonus_check" CHECK (abs("bonus") <= abs("amount") AND ("bonus" = 0 OR sign("bonus") = sign("amount")))
 );
+
+COMMENT ON COLUMN "payments"."credits_ledger"."fee" IS 'The part of a usage charge that is the extra-session fee; the rest is the script''s price.';
+
+COMMENT ON COLUMN "payments"."credits_ledger"."bonus" IS 'The part of amount that moved bonus credits, with the sign of amount.';
 
 
 CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
@@ -104,9 +120,13 @@ CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
     "session_id" "uuid",
     "minutes" integer,
     "note" "text",
+    "bonus" bigint DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "earnings_ledger_amount_check" CHECK ("amount" <> 0)
+    CONSTRAINT "earnings_ledger_amount_check" CHECK ("amount" <> 0 OR "bonus" > 0),
+    CONSTRAINT "earnings_ledger_bonus_check" CHECK ("bonus" >= 0)
 );
+
+COMMENT ON COLUMN "payments"."earnings_ledger"."bonus" IS 'The part of a sale''s share that was not paid because the buyer paid with bonus credits.';
 
 
 -- One row per script run, free or premium; no FKs so history survives deletions
@@ -123,12 +143,15 @@ CREATE TABLE IF NOT EXISTS "payments"."sessions" (
     "ended_at" timestamp with time zone,
     "end_reason" "payments"."session_end",
     "unpaid" bigint DEFAULT 0 NOT NULL,
+    "fee_accrued" bigint DEFAULT 0 NOT NULL,
+    "fee_charged" bigint DEFAULT 0 NOT NULL,
     CONSTRAINT "sessions_price_check" CHECK ("price" >= 0),
     CONSTRAINT "sessions_unpaid_check" CHECK ("unpaid" >= 0),
+    CONSTRAINT "sessions_fee_check" CHECK ("fee_accrued" >= 0 AND "fee_charged" >= 0),
     CONSTRAINT "sessions_end_check" CHECK (("ended_at" IS NULL) = ("end_reason" IS NULL))
 );
 
-COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover.';
+COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in credit-minutes (a credit is charged per 43200), fee_charged the fee credits charged so far.';
 
 -- Keys
 
@@ -181,28 +204,37 @@ CREATE OR REPLACE FUNCTION "payments"."post_credits"(
     "p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint,
     "p_payment" "uuid" DEFAULT NULL, "p_script" "uuid" DEFAULT NULL,
     "p_minutes" integer DEFAULT NULL, "p_note" "text" DEFAULT NULL, "p_session" "uuid" DEFAULT NULL,
-    "p_actor" "uuid" DEFAULT NULL
+    "p_actor" "uuid" DEFAULT NULL, "p_bonus" bigint DEFAULT NULL, "p_fee" bigint DEFAULT 0
 ) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
     AS $$
 DECLARE
-  v_balance bigint;
+  v_account payments.accounts;
+  v_bonus bigint;
 BEGIN
-  UPDATE payments.accounts
-  SET credits = credits + p_amount, updated_at = now()
-  WHERE user_id = p_user
-  RETURNING credits INTO v_balance;
+  SELECT * INTO v_account FROM payments.accounts WHERE user_id = p_user FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by)
-  VALUES (p_user, p_kind, p_amount, v_balance, p_payment, p_script, p_session, p_minutes, p_note, p_actor);
+  -- Unless told otherwise, spending takes bonus credits in the balance's proportion and gains bring none
+  v_bonus := COALESCE(p_bonus, CASE
+    WHEN p_amount < 0 AND v_account.credits > 0 THEN -(LEAST(-p_amount, v_account.credits) * v_account.bonus_credits / v_account.credits)
+    ELSE 0
+  END);
 
-  RETURN v_balance;
+  UPDATE payments.accounts
+  SET credits = credits + p_amount, bonus_credits = bonus_credits + v_bonus, updated_at = now()
+  WHERE user_id = p_user
+  RETURNING * INTO v_account;
+
+  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by, fee, bonus)
+  VALUES (p_user, p_kind, p_amount, v_account.credits, p_payment, p_script, p_session, p_minutes, p_note, p_actor, p_fee, v_bonus);
+
+  RETURN v_account.credits;
 END;
 $$;
 
@@ -210,7 +242,8 @@ $$;
 -- Same for the scripter earnings ledger
 CREATE OR REPLACE FUNCTION "payments"."post_earnings"(
     "p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint,
-    "p_script" "uuid" DEFAULT NULL, "p_minutes" integer DEFAULT NULL, "p_note" "text" DEFAULT NULL, "p_session" "uuid" DEFAULT NULL
+    "p_script" "uuid" DEFAULT NULL, "p_minutes" integer DEFAULT NULL, "p_note" "text" DEFAULT NULL, "p_session" "uuid" DEFAULT NULL,
+    "p_bonus" bigint DEFAULT 0
 ) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -228,8 +261,8 @@ BEGIN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  INSERT INTO payments.earnings_ledger (user_id, kind, amount, balance_after, script_id, session_id, minutes, note)
-  VALUES (p_user, p_kind, p_amount, v_balance, p_script, p_session, p_minutes, p_note);
+  INSERT INTO payments.earnings_ledger (user_id, kind, amount, balance_after, script_id, session_id, minutes, note, bonus)
+  VALUES (p_user, p_kind, p_amount, v_balance, p_script, p_session, p_minutes, p_note, p_bonus);
 
   RETURN v_balance;
 END;
@@ -257,7 +290,7 @@ BEGIN
 
   UPDATE payments.payments SET status = 'paid', paid_at = now() WHERE id = p_payment;
 
-  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.credits, p_payment);
+  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.credits, p_payment, NULL, NULL, NULL, NULL, NULL, v_payment.bonus);
 
   RETURN true;
 END;
@@ -270,6 +303,66 @@ CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETUR
     SET "search_path" TO ''
     AS $$
   SELECT p_price * min_balance_minutes FROM payments.config;
+$$;
+
+-- A month of running, the unit extra_session_fee is quoted in
+CREATE OR REPLACE FUNCTION "payments"."minutes_per_month"() RETURNS integer
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT 30 * 24 * 60;
+$$;
+
+-- The balance a session at p_price with a fee of p_fee credits per month needs: min_balance_minutes of both, the fee rounded up
+CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) RETURNS bigint
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT c.min_balance_minutes * p_price + ceil(c.min_balance_minutes * p_fee::numeric / payments.minutes_per_month())::bigint
+  FROM payments.config c;
+$$;
+
+-- How many of the account's other open sessions started before this one: 0 for the oldest, which runs without a fee
+CREATE OR REPLACE FUNCTION "payments"."session_rank"("p_session" "uuid") RETURNS integer
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT count(*)::integer
+  FROM payments.sessions s
+  JOIN payments.sessions o ON o.user_id = s.user_id AND o.ended_at IS NULL AND o.id <> s.id
+  WHERE s.id = p_session AND (o.started_at, o.id) < (s.started_at, s.id);
+$$;
+
+-- The fee a session of this rank accrues, in credits per month: nothing for the oldest session or for tester+
+CREATE OR REPLACE FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) RETURNS bigint
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT CASE
+    WHEN p_rank >= 1 AND NOT profiles.min_role(p_user, 'tester'::profiles.roles) THEN (SELECT c.extra_session_fee FROM payments.config c)
+    ELSE 0
+  END;
+$$;
+
+-- What starting the script now would cost the user: its price, the rank the session would take, the fee at that rank and the balance needed
+CREATE OR REPLACE FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("price" bigint, "rank" integer, "fee" bigint, "required" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  WITH open AS (
+    SELECT count(*)::integer AS rank FROM payments.sessions s WHERE s.user_id = p_user AND s.ended_at IS NULL
+  ), priced AS (
+    SELECT CASE
+      WHEN p.author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) OR scripts.has_grant(p_user, p_script) THEN 0
+      ELSE m.price
+    END AS price
+    FROM scripts.protected p
+    JOIN scripts.metadata m ON m.id = p.id
+    WHERE p.id = p_script
+  )
+  SELECT priced.price, open.rank, payments.session_fee(p_user, open.rank), payments.required_balance(priced.price, payments.session_fee(p_user, open.rank))
+  FROM priced, open;
 $$;
 
 -- Average per-minute price of runnable paid scripts, or NULL; definer so it sees all of them
@@ -296,10 +389,16 @@ CREATE OR REPLACE FUNCTION "payments"."charge_session"("p_session" "uuid", "p_mi
     AS $$
 DECLARE
   v_session payments.sessions;
+  v_account payments.accounts;
+  v_accrued bigint;
+  v_fee_due bigint;
   v_cost bigint;
-  v_available bigint;
+  v_total bigint;
   v_charged bigint;
+  v_fee_paid bigint;
+  v_bonus bigint;
   v_share bigint;
+  v_lost bigint;
 BEGIN
   SELECT * INTO v_session FROM payments.sessions WHERE id = p_session;
 
@@ -307,36 +406,58 @@ BEGIN
     RAISE EXCEPTION 'session % not found', p_session;
   END IF;
 
-  IF v_session.price = 0 OR p_minutes <= 0 THEN
+  IF p_minutes <= 0 THEN
     RETURN 0;
   END IF;
 
+  -- the fee accrues at the rank the session holds now, and a credit is charged for every month's worth of credit-minutes
+  v_accrued := v_session.fee_accrued + payments.session_fee(v_session.user_id, payments.session_rank(p_session)) * p_minutes;
+  v_fee_due := v_accrued / payments.minutes_per_month();
+  UPDATE payments.sessions SET fee_accrued = v_accrued % payments.minutes_per_month() WHERE id = p_session;
+
   v_cost := v_session.price * p_minutes;
+  v_total := v_cost + v_fee_due;
+
+  IF v_total = 0 THEN
+    RETURN 0;
+  END IF;
 
   -- lock the account so concurrent sessions can't both spend the same credits
-  SELECT credits INTO v_available FROM payments.accounts WHERE user_id = v_session.user_id FOR UPDATE;
+  SELECT * INTO v_account FROM payments.accounts WHERE user_id = v_session.user_id FOR UPDATE;
 
   -- a deleted user can't pay: the whole cost is unpaid
   IF NOT FOUND THEN
-    UPDATE payments.sessions SET unpaid = unpaid + v_cost WHERE id = p_session;
+    UPDATE payments.sessions SET unpaid = unpaid + v_total WHERE id = p_session;
     RETURN 0;
   END IF;
 
-  v_charged := LEAST(v_cost, v_available);
+  v_charged := LEAST(v_total, v_account.credits);
 
-  IF v_charged < v_cost THEN
-    UPDATE payments.sessions SET unpaid = unpaid + (v_cost - v_charged) WHERE id = p_session;
+  IF v_charged < v_total THEN
+    UPDATE payments.sessions SET unpaid = unpaid + (v_total - v_charged) WHERE id = p_session;
   END IF;
 
-  IF v_charged > 0 THEN
-    PERFORM payments.post_credits(v_session.user_id, 'usage', -v_charged, NULL, v_session.script_id, p_minutes, NULL, p_session);
+  IF v_charged = 0 THEN
+    RETURN 0;
+  END IF;
 
-    v_share := v_charged * (10000 - (SELECT platform_fee_bps FROM payments.config)) / 10000;
+  -- the script is paid first, the fee with what is left; bonus credits pay their share of the balance
+  v_fee_paid := GREATEST(v_charged - v_cost, 0);
+  v_bonus := v_charged * v_account.bonus_credits / v_account.credits;
 
-    -- a deleted author has no account: the platform keeps the share
-    IF v_share > 0 AND EXISTS (SELECT 1 FROM payments.accounts WHERE user_id = v_session.author_id) THEN
-      PERFORM payments.post_earnings(v_session.author_id, 'sale', v_share, v_session.script_id, p_minutes, NULL, p_session);
-    END IF;
+  PERFORM payments.post_credits(v_session.user_id, 'usage', -v_charged, NULL, v_session.script_id, p_minutes, NULL, p_session, NULL, -v_bonus, v_fee_paid);
+
+  IF v_fee_paid > 0 THEN
+    UPDATE payments.sessions SET fee_charged = fee_charged + v_fee_paid WHERE id = p_session;
+  END IF;
+
+  -- the author's share is of the script's part only, and the part paid with bonus credits is lost, not paid
+  v_share := (v_charged - v_fee_paid) * (10000 - (SELECT platform_fee_bps FROM payments.config)) / 10000;
+  v_lost := v_share * v_bonus / v_charged;
+
+  -- a deleted author has no account: the platform keeps the share
+  IF v_share > 0 AND EXISTS (SELECT 1 FROM payments.accounts WHERE user_id = v_session.author_id) THEN
+    PERFORM payments.post_earnings(v_session.author_id, 'sale', v_share - v_lost, v_session.script_id, p_minutes, NULL, p_session, v_lost);
   END IF;
 
   RETURN v_charged;
@@ -344,7 +465,7 @@ END;
 $$;
 
 -- Starts a session at a fixed price (service_role) and returns the live revision's files
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text")
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint)
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -357,6 +478,9 @@ DECLARE
   v_files text[];
   v_entry text;
   v_id uuid;
+  v_rank integer;
+  v_fee bigint;
+  v_required bigint;
 BEGIN
   IF profiles.is_banned(p_user) THEN
     RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
@@ -383,8 +507,12 @@ BEGIN
     ELSE v_listed_price
   END;
 
-  IF v_price > 0 AND COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = p_user), 0)
-                     < payments.required_balance(v_price) THEN
+  -- the new session ranks after every open one, and an extra instance pays the fee even on a free script
+  SELECT count(*)::integer INTO v_rank FROM payments.sessions s WHERE s.user_id = p_user AND s.ended_at IS NULL;
+  v_fee := payments.session_fee(p_user, v_rank);
+  v_required := payments.required_balance(v_price, v_fee);
+
+  IF v_required > 0 AND COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = p_user), 0) < v_required THEN
     RAISE EXCEPTION 'insufficient credits' USING ERRCODE = 'check_violation';
   END IF;
 
@@ -392,7 +520,7 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee;
 END;
 $$;
 
@@ -443,6 +571,7 @@ DECLARE
   v_session payments.sessions;
   v_minutes integer;
   v_balance bigint;
+  v_required bigint;
 BEGIN
   SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR UPDATE;
 
@@ -466,10 +595,12 @@ BEGIN
     UPDATE payments.sessions SET charged_until = charged_until + make_interval(mins => v_minutes) WHERE id = p_session;
   END IF;
 
-  IF v_session.price > 0 THEN
+  v_required := payments.required_balance(v_session.price, payments.session_fee(v_session.user_id, payments.session_rank(p_session)));
+
+  IF v_required > 0 THEN
     SELECT credits INTO v_balance FROM payments.accounts WHERE user_id = v_session.user_id;
 
-    IF COALESCE(v_balance, 0) < payments.required_balance(v_session.price) THEN
+    IF COALESCE(v_balance, 0) < v_required THEN
       PERFORM payments.end_session(p_session, 'insufficient_credits');
       RETURN false;
     END IF;
@@ -694,9 +825,19 @@ GRANT SELECT ON TABLE "payments"."accounts", "payments"."payments", "payments"."
 GRANT ALL ON TABLE "payments"."config", "payments"."payments" TO "service_role";
 GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" TO "service_role";
 
-REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid", bigint, bigint) FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."minutes_per_month"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."required_balance"(bigint, bigint) FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."session_rank"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."session_fee"("uuid", integer) FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."session_quote"("uuid", "uuid") FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "payments"."minutes_per_month"() TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."required_balance"(bigint, bigint) TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."session_rank"("uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."session_fee"("uuid", integer) TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."session_quote"("uuid", "uuid") TO "service_role";
 REVOKE ALL ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "text") FROM PUBLIC, "anon", "authenticated";
-REVOKE ALL ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid", bigint) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."settle_payment"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."required_balance"(bigint) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."average_price"() FROM PUBLIC, "anon", "authenticated";
@@ -713,9 +854,9 @@ REVOKE ALL ON FUNCTION "payments"."tr_ledger_immutable"() FROM PUBLIC, "anon", "
 REVOKE ALL ON FUNCTION "payments"."tr_accounts_pre_delete"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."tr_payments_limit_pending"() FROM PUBLIC, "anon", "authenticated";
 
-GRANT EXECUTE ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid", bigint, bigint) TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."adjust_credits"("uuid", "uuid", bigint, "text") TO "service_role";
-GRANT EXECUTE ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."post_earnings"("uuid", "payments"."earning_kind", bigint, "uuid", integer, "text", "uuid", bigint) TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."settle_payment"("uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."required_balance"(bigint) TO "service_role";
 -- The credits page is for logged-in users only
