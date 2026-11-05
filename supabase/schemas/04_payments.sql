@@ -631,6 +631,31 @@ BEGIN
 END;
 $$;
 
+-- Ends a session from the website: its owner or moderator+. The loader stops the script at its next heartbeat, which answers stopped.
+CREATE OR REPLACE FUNCTION "payments"."stop_session"("p_session" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR UPDATE;
+
+  IF NOT FOUND OR auth.uid() IS NULL
+     OR NOT (v_session.user_id = auth.uid() OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  PERFORM payments.end_session(p_session, 'stopped');
+  RETURN true;
+END;
+$$;
+
 -- Ends sessions whose loader stopped heartbeating, charged up to last_seen (pg_cron)
 CREATE OR REPLACE FUNCTION "payments"."end_stale_sessions"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
@@ -847,6 +872,7 @@ REVOKE ALL ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end"
 REVOKE ALL ON FUNCTION "payments"."heartbeat_session"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_stale_sessions"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_user_sessions"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."stop_session"("uuid") FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "payments"."tr_profiles_pre_delete"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."transfer_earnings"(bigint) FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "payments"."tr_profiles_post_insert"() FROM PUBLIC, "anon", "authenticated";
@@ -866,3 +892,4 @@ GRANT EXECUTE ON FUNCTION "payments"."end_session"("uuid", "payments"."session_e
 GRANT EXECUTE ON FUNCTION "payments"."heartbeat_session"("uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."end_stale_sessions"() TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."transfer_earnings"(bigint) TO "authenticated", "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."stop_session"("uuid") TO "authenticated", "service_role";
