@@ -16,6 +16,12 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
+CREATE SCHEMA IF NOT EXISTS "feedback";
+
+
+ALTER SCHEMA "feedback" OWNER TO "supabase_admin";
+
+
 CREATE SCHEMA IF NOT EXISTS "info";
 
 
@@ -54,6 +60,17 @@ CREATE SCHEMA IF NOT EXISTS "stats";
 
 
 ALTER SCHEMA "stats" OWNER TO "postgres";
+
+
+CREATE TYPE "feedback"."report_status" AS ENUM (
+    'open',
+    'in_progress',
+    'resolved',
+    'rejected'
+);
+
+
+ALTER TYPE "feedback"."report_status" OWNER TO "supabase_admin";
 
 
 CREATE TYPE "info"."kind" AS ENUM (
@@ -215,6 +232,316 @@ ALTER TYPE "scripts"."version_status" OWNER TO "supabase_admin";
 COMMENT ON TYPE "scripts"."version_status" IS 'Revision lifecycle';
 
 
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "feedback"."reports" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "script_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "revision" integer NOT NULL,
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "log" "text",
+    "snapshot" "jsonb",
+    "diagnostics" "jsonb",
+    "assigned_to" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "status" "feedback"."report_status" DEFAULT 'open'::"feedback"."report_status" NOT NULL,
+    CONSTRAINT "reports_description_check" CHECK (("char_length"("description") <= 2000)),
+    CONSTRAINT "reports_diagnostics_check" CHECK ((("diagnostics" IS NULL) OR ("pg_column_size"("diagnostics") <= 16384))),
+    CONSTRAINT "reports_log_check" CHECK ((("log" IS NULL) OR ("octet_length"("log") <= 262144))),
+    CONSTRAINT "reports_snapshot_check" CHECK ((("snapshot" IS NULL) OR ("pg_column_size"("snapshot") <= 65536)))
+);
+
+
+ALTER TABLE "feedback"."reports" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "feedback"."reports" IS 'Bug reports. Written only by feedback.report_session. Visible to the reporter, the script author, the assigned tester and moderator+; clients may change status and assigned_to only.';
+
+
+
+CREATE OR REPLACE FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT auth.uid() IS NOT NULL AND (
+    r.assigned_to = auth.uid()
+    OR scripts.is_author(auth.uid(), r.script_id)
+    OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
+  );
+$$;
+
+
+ALTER FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT auth.uid() IS NOT NULL AND (
+    r.user_id = auth.uid()
+    OR r.assigned_to = auth.uid()
+    OR scripts.is_author(auth.uid(), r.script_id)
+    OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)
+  );
+$$;
+
+
+ALTER FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."clear_old_attachments"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_count integer;
+BEGIN
+  UPDATE feedback.reports r SET log = NULL, snapshot = NULL, diagnostics = NULL
+  WHERE r.created_at < now() - interval '90 days'
+    AND (r.log IS NOT NULL OR r.snapshot IS NOT NULL OR r.diagnostics IS NOT NULL);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."clear_old_attachments"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."list_reports"("p_script" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "script_id" "uuid", "script_title" "text", "script_url" "text", "user_id" "uuid", "username" "text", "session_id" "uuid", "revision" integer, "description" "text", "has_log" boolean, "has_snapshot" boolean, "has_diagnostics" boolean, "status" "feedback"."report_status", "assigned_to" "uuid", "assignee" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT r.id, r.script_id, s.title, s.url, r.user_id, u.username, r.session_id, r.revision, r.description,
+    r.log IS NOT NULL, r.snapshot IS NOT NULL, r.diagnostics IS NOT NULL,
+    r.status, r.assigned_to, a.username, r.created_at, r.updated_at
+  FROM feedback.reports r
+  JOIN scripts.scripts s ON s.id = r.script_id
+  JOIN profiles.profiles u ON u.id = r.user_id
+  LEFT JOIN profiles.profiles a ON a.id = r.assigned_to
+  WHERE (p_script IS NULL OR r.script_id = p_script) AND feedback.can_view_report(r)
+  ORDER BY r.created_at DESC
+  LIMIT 200;
+$$;
+
+
+ALTER FUNCTION "feedback"."list_reports"("p_script" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."list_testers"() RETURNS TABLE("id" "uuid", "username" "text", "role" "profiles"."roles")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT p.id, p.username, p.role
+  FROM profiles.profiles p
+  WHERE p.role >= 'tester'::profiles.roles AND p.banned_at IS NULL
+    AND auth.uid() IS NOT NULL
+    AND (profiles.min_role(auth.uid(), 'moderator'::profiles.roles) OR EXISTS (SELECT 1 FROM scripts.protected pr WHERE pr.author = auth.uid()))
+  ORDER BY p.username
+  LIMIT 200;
+$$;
+
+
+ALTER FUNCTION "feedback"."list_testers"() OWNER TO "supabase_admin";
+
+
+CREATE TABLE IF NOT EXISTS "payments"."sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "script_id" "uuid" NOT NULL,
+    "author_id" "uuid" NOT NULL,
+    "revision" integer NOT NULL,
+    "price" bigint NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_seen" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "charged_until" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "ended_at" timestamp with time zone,
+    "unpaid" bigint DEFAULT 0 NOT NULL,
+    "end_reason" "payments"."session_end",
+    "fee_accrued" bigint DEFAULT 0 NOT NULL,
+    "fee_charged" bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT "sessions_end_check" CHECK ((("ended_at" IS NULL) = ("end_reason" IS NULL))),
+    CONSTRAINT "sessions_fee_check" CHECK ((("fee_accrued" >= 0) AND ("fee_charged" >= 0))),
+    CONSTRAINT "sessions_price_check" CHECK (("price" >= 0)),
+    CONSTRAINT "sessions_unpaid_check" CHECK (("unpaid" >= 0))
+);
+
+
+ALTER TABLE "payments"."sessions" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in credit-minutes (a credit is charged per 43200), fee_charged the fee credits charged so far.';
+
+
+
+CREATE OR REPLACE FUNCTION "feedback"."recent_session"("p_user" "uuid", "p_session" "uuid") RETURNS "payments"."sessions"
+    LANGUAGE "plpgsql" STABLE
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  v_session payments.sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.sessions s WHERE s.id = p_session AND s.user_id = p_user;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found';
+  END IF;
+  IF COALESCE(v_session.ended_at, now()) < now() - interval '24 hours' THEN
+    RAISE EXCEPTION 'session too old' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  RETURN v_session;
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."recent_session"("p_user" "uuid", "p_session" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."recent_sessions"("p_user" "uuid") RETURNS TABLE("session_id" "uuid", "script_id" "uuid", "title" "text", "url" "text", "revision" integer, "started_at" timestamp with time zone, "ended_at" timestamp with time zone, "score" smallint, "reports" integer)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT s.id, s.script_id, sc.title, sc.url, s.revision, s.started_at, s.ended_at,
+    (SELECT f.score FROM feedback.scores f WHERE f.script_id = s.script_id AND f.user_id = p_user),
+    (SELECT count(*)::integer FROM feedback.reports r WHERE r.session_id = s.id)
+  FROM payments.sessions s
+  JOIN scripts.scripts sc ON sc.id = s.script_id
+  WHERE s.user_id = p_user AND COALESCE(s.ended_at, now()) >= now() - interval '24 hours'
+  ORDER BY s.started_at DESC
+  LIMIT 50;
+$$;
+
+
+ALTER FUNCTION "feedback"."recent_sessions"("p_user" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."report_session"("p_user" "uuid", "p_session" "uuid", "p_description" "text", "p_log" "text", "p_snapshot" "jsonb", "p_diagnostics" "jsonb") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.sessions;
+  v_id uuid;
+BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  v_session := feedback.recent_session(p_user, p_session);
+
+  PERFORM pg_advisory_xact_lock(hashtext('feedback.reports.' || p_user::text));
+  IF (SELECT count(*) FROM feedback.reports r WHERE r.user_id = p_user AND r.created_at > now() - interval '1 hour') >= 5 THEN
+    RAISE EXCEPTION 'too many reports' USING ERRCODE = 'program_limit_exceeded';
+  END IF;
+
+  INSERT INTO feedback.reports (script_id, user_id, session_id, revision, description, log, snapshot, diagnostics)
+  VALUES (v_session.script_id, p_user, v_session.id, v_session.revision, COALESCE(btrim(p_description), ''), NULLIF(p_log, ''), p_snapshot, p_diagnostics)
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."report_session"("p_user" "uuid", "p_session" "uuid", "p_description" "text", "p_log" "text", "p_snapshot" "jsonb", "p_diagnostics" "jsonb") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."score_session"("p_user" "uuid", "p_session" "uuid", "p_score" integer) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.sessions;
+BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF p_score IS NULL OR p_score < 1 OR p_score > 10 THEN
+    RAISE EXCEPTION 'score must be 1 to 10' USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_session := feedback.recent_session(p_user, p_session);
+
+  INSERT INTO feedback.scores AS f (script_id, user_id, session_id, revision, score)
+  VALUES (v_session.script_id, p_user, v_session.id, v_session.revision, p_score)
+  ON CONFLICT (script_id, user_id) DO UPDATE
+    SET session_id = EXCLUDED.session_id, revision = EXCLUDED.revision, score = EXCLUDED.score, updated_at = now();
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."score_session"("p_user" "uuid", "p_session" "uuid", "p_score" integer) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."score_summary"("p_script" "uuid") RETURNS TABLE("count" integer, "average" numeric, "histogram" integer[])
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL OR NOT (scripts.is_author(auth.uid(), p_script) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    (SELECT count(*)::integer FROM feedback.scores f WHERE f.script_id = p_script),
+    (SELECT round(avg(f.score), 2) FROM feedback.scores f WHERE f.script_id = p_script),
+    (SELECT array_agg(h.c ORDER BY h.n) FROM (
+       SELECT n, (SELECT count(*)::integer FROM feedback.scores f WHERE f.script_id = p_script AND f.score = n) AS c
+       FROM generate_series(1, 10) n) h);
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."score_summary"("p_script" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "feedback"."tr_reports_pre_update"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  IF auth.uid() IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.id <> OLD.id OR NEW.script_id <> OLD.script_id OR NEW.user_id <> OLD.user_id OR NEW.session_id <> OLD.session_id
+    OR NEW.revision <> OLD.revision OR NEW.description <> OLD.description OR NEW.log IS DISTINCT FROM OLD.log
+    OR NEW.snapshot IS DISTINCT FROM OLD.snapshot OR NEW.diagnostics IS DISTINCT FROM OLD.diagnostics
+    OR NEW.created_at <> OLD.created_at THEN
+    RAISE EXCEPTION 'only status and assigned_to can change' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NEW.assigned_to IS DISTINCT FROM OLD.assigned_to THEN
+    IF NOT (scripts.is_author(auth.uid(), OLD.script_id) OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)) THEN
+      RAISE EXCEPTION 'only the author or a moderator can assign a report' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF NEW.assigned_to IS NOT NULL AND NOT profiles.min_role(NEW.assigned_to, 'tester'::profiles.roles) THEN
+      RAISE EXCEPTION 'reports can only be assigned to testers' USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "feedback"."tr_reports_pre_update"() OWNER TO "supabase_admin";
+
 
 CREATE OR REPLACE FUNCTION "info"."accept_terms"("p_kind" "info"."kind", "p_version" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
@@ -312,10 +639,16 @@ CREATE OR REPLACE FUNCTION "payments"."charge_session"("p_session" "uuid", "p_mi
     AS $$
 DECLARE
   v_session payments.sessions;
+  v_account payments.accounts;
+  v_accrued bigint;
+  v_fee_due bigint;
   v_cost bigint;
-  v_available bigint;
+  v_total bigint;
   v_charged bigint;
+  v_fee_paid bigint;
+  v_bonus bigint;
   v_share bigint;
+  v_lost bigint;
 BEGIN
   SELECT * INTO v_session FROM payments.sessions WHERE id = p_session;
 
@@ -323,36 +656,58 @@ BEGIN
     RAISE EXCEPTION 'session % not found', p_session;
   END IF;
 
-  IF v_session.price = 0 OR p_minutes <= 0 THEN
+  IF p_minutes <= 0 THEN
     RETURN 0;
   END IF;
 
+  -- the fee accrues at the rank the session holds now, and a credit is charged for every month's worth of credit-minutes
+  v_accrued := v_session.fee_accrued + payments.session_fee(v_session.user_id, payments.session_rank(p_session)) * p_minutes;
+  v_fee_due := v_accrued / payments.minutes_per_month();
+  UPDATE payments.sessions SET fee_accrued = v_accrued % payments.minutes_per_month() WHERE id = p_session;
+
   v_cost := v_session.price * p_minutes;
+  v_total := v_cost + v_fee_due;
+
+  IF v_total = 0 THEN
+    RETURN 0;
+  END IF;
 
   -- lock the account so concurrent sessions can't both spend the same credits
-  SELECT credits INTO v_available FROM payments.accounts WHERE user_id = v_session.user_id FOR UPDATE;
+  SELECT * INTO v_account FROM payments.accounts WHERE user_id = v_session.user_id FOR UPDATE;
 
   -- a deleted user can't pay: the whole cost is unpaid
   IF NOT FOUND THEN
-    UPDATE payments.sessions SET unpaid = unpaid + v_cost WHERE id = p_session;
+    UPDATE payments.sessions SET unpaid = unpaid + v_total WHERE id = p_session;
     RETURN 0;
   END IF;
 
-  v_charged := LEAST(v_cost, v_available);
+  v_charged := LEAST(v_total, v_account.credits);
 
-  IF v_charged < v_cost THEN
-    UPDATE payments.sessions SET unpaid = unpaid + (v_cost - v_charged) WHERE id = p_session;
+  IF v_charged < v_total THEN
+    UPDATE payments.sessions SET unpaid = unpaid + (v_total - v_charged) WHERE id = p_session;
   END IF;
 
-  IF v_charged > 0 THEN
-    PERFORM payments.post_credits(v_session.user_id, 'usage', -v_charged, NULL, v_session.script_id, p_minutes, NULL, p_session);
+  IF v_charged = 0 THEN
+    RETURN 0;
+  END IF;
 
-    v_share := v_charged * (10000 - (SELECT platform_fee_bps FROM payments.config)) / 10000;
+  -- the script is paid first, the fee with what is left; bonus credits pay their share of the balance
+  v_fee_paid := GREATEST(v_charged - v_cost, 0);
+  v_bonus := v_charged * v_account.bonus_credits / v_account.credits;
 
-    -- a deleted author has no account: the platform keeps the share
-    IF v_share > 0 AND EXISTS (SELECT 1 FROM payments.accounts WHERE user_id = v_session.author_id) THEN
-      PERFORM payments.post_earnings(v_session.author_id, 'sale', v_share, v_session.script_id, p_minutes, NULL, p_session);
-    END IF;
+  PERFORM payments.post_credits(v_session.user_id, 'usage', -v_charged, NULL, v_session.script_id, p_minutes, NULL, p_session, NULL, -v_bonus, v_fee_paid);
+
+  IF v_fee_paid > 0 THEN
+    UPDATE payments.sessions SET fee_charged = fee_charged + v_fee_paid WHERE id = p_session;
+  END IF;
+
+  -- the author's share is of the script's part only, and the part paid with bonus credits is lost, not paid
+  v_share := (v_charged - v_fee_paid) * (10000 - (SELECT platform_fee_bps FROM payments.config)) / 10000;
+  v_lost := v_share * v_bonus / v_charged;
+
+  -- a deleted author has no account: the platform keeps the share
+  IF v_share > 0 AND EXISTS (SELECT 1 FROM payments.accounts WHERE user_id = v_session.author_id) THEN
+    PERFORM payments.post_earnings(v_session.author_id, 'sale', v_share - v_lost, v_session.script_id, p_minutes, NULL, p_session, v_lost);
   END IF;
 
   RETURN v_charged;
@@ -474,6 +829,7 @@ DECLARE
   v_session payments.sessions;
   v_minutes integer;
   v_balance bigint;
+  v_required bigint;
 BEGIN
   SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR UPDATE;
 
@@ -497,10 +853,12 @@ BEGIN
     UPDATE payments.sessions SET charged_until = charged_until + make_interval(mins => v_minutes) WHERE id = p_session;
   END IF;
 
-  IF v_session.price > 0 THEN
+  v_required := payments.required_balance(v_session.price, payments.session_fee(v_session.user_id, payments.session_rank(p_session)));
+
+  IF v_required > 0 THEN
     SELECT credits INTO v_balance FROM payments.accounts WHERE user_id = v_session.user_id;
 
-    IF COALESCE(v_balance, 0) < payments.required_balance(v_session.price) THEN
+    IF COALESCE(v_balance, 0) < v_required THEN
       PERFORM payments.end_session(p_session, 'insufficient_credits');
       RETURN false;
     END IF;
@@ -514,35 +872,55 @@ $$;
 ALTER FUNCTION "payments"."heartbeat_session"("p_session" "uuid") OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid" DEFAULT NULL::"uuid", "p_script" "uuid" DEFAULT NULL::"uuid", "p_minutes" integer DEFAULT NULL::integer, "p_note" "text" DEFAULT NULL::"text", "p_session" "uuid" DEFAULT NULL::"uuid", "p_actor" "uuid" DEFAULT NULL::"uuid") RETURNS bigint
+CREATE OR REPLACE FUNCTION "payments"."minutes_per_month"() RETURNS integer
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT 30 * 24 * 60;
+$$;
+
+
+ALTER FUNCTION "payments"."minutes_per_month"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid" DEFAULT NULL::"uuid", "p_script" "uuid" DEFAULT NULL::"uuid", "p_minutes" integer DEFAULT NULL::integer, "p_note" "text" DEFAULT NULL::"text", "p_session" "uuid" DEFAULT NULL::"uuid", "p_actor" "uuid" DEFAULT NULL::"uuid", "p_bonus" bigint DEFAULT NULL::bigint, "p_fee" bigint DEFAULT 0) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
     AS $$
 DECLARE
-  v_balance bigint;
+  v_account payments.accounts;
+  v_bonus bigint;
 BEGIN
-  UPDATE payments.accounts
-  SET credits = credits + p_amount, updated_at = now()
-  WHERE user_id = p_user
-  RETURNING credits INTO v_balance;
+  SELECT * INTO v_account FROM payments.accounts WHERE user_id = p_user FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by)
-  VALUES (p_user, p_kind, p_amount, v_balance, p_payment, p_script, p_session, p_minutes, p_note, p_actor);
+  -- Unless told otherwise, spending takes bonus credits in the balance's proportion and gains bring none
+  v_bonus := COALESCE(p_bonus, CASE
+    WHEN p_amount < 0 AND v_account.credits > 0 THEN -(LEAST(-p_amount, v_account.credits) * v_account.bonus_credits / v_account.credits)
+    ELSE 0
+  END);
 
-  RETURN v_balance;
+  UPDATE payments.accounts
+  SET credits = credits + p_amount, bonus_credits = bonus_credits + v_bonus, updated_at = now()
+  WHERE user_id = p_user
+  RETURNING * INTO v_account;
+
+  INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by, fee, bonus)
+  VALUES (p_user, p_kind, p_amount, v_account.credits, p_payment, p_script, p_session, p_minutes, p_note, p_actor, p_fee, v_bonus);
+
+  RETURN v_account.credits;
 END;
 $$;
 
 
-ALTER FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid") OWNER TO "supabase_admin";
+ALTER FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid", "p_bonus" bigint, "p_fee" bigint) OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid" DEFAULT NULL::"uuid", "p_minutes" integer DEFAULT NULL::integer, "p_note" "text" DEFAULT NULL::"text", "p_session" "uuid" DEFAULT NULL::"uuid") RETURNS bigint
+CREATE OR REPLACE FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid" DEFAULT NULL::"uuid", "p_minutes" integer DEFAULT NULL::integer, "p_note" "text" DEFAULT NULL::"text", "p_session" "uuid" DEFAULT NULL::"uuid", "p_bonus" bigint DEFAULT 0) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -559,15 +937,15 @@ BEGIN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  INSERT INTO payments.earnings_ledger (user_id, kind, amount, balance_after, script_id, session_id, minutes, note)
-  VALUES (p_user, p_kind, p_amount, v_balance, p_script, p_session, p_minutes, p_note);
+  INSERT INTO payments.earnings_ledger (user_id, kind, amount, balance_after, script_id, session_id, minutes, note, bonus)
+  VALUES (p_user, p_kind, p_amount, v_balance, p_script, p_session, p_minutes, p_note, p_bonus);
 
   RETURN v_balance;
 END;
 $$;
 
 
-ALTER FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid") OWNER TO "supabase_admin";
+ALTER FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_bonus" bigint) OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETURNS bigint
@@ -579,6 +957,70 @@ $$;
 
 
 ALTER FUNCTION "payments"."required_balance"("p_price" bigint) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) RETURNS bigint
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT c.min_balance_minutes * p_price + ceil(c.min_balance_minutes * p_fee::numeric / payments.minutes_per_month())::bigint
+  FROM payments.config c;
+$$;
+
+
+ALTER FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) RETURNS bigint
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT CASE
+    WHEN p_rank >= 1 AND NOT profiles.min_role(p_user, 'tester'::profiles.roles) THEN (SELECT c.extra_session_fee FROM payments.config c)
+    ELSE 0
+  END;
+$$;
+
+
+ALTER FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("price" bigint, "rank" integer, "fee" bigint, "required" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  WITH open AS (
+    SELECT count(*)::integer AS rank FROM payments.sessions s WHERE s.user_id = p_user AND s.ended_at IS NULL
+  ), priced AS (
+    SELECT CASE
+      WHEN p.author = p_user OR profiles.min_role(p_user, 'tester'::profiles.roles) OR scripts.has_grant(p_user, p_script) THEN 0
+      ELSE m.price
+    END AS price
+    FROM scripts.protected p
+    JOIN scripts.metadata m ON m.id = p.id
+    WHERE p.id = p_script
+  )
+  SELECT priced.price, open.rank, payments.session_fee(p_user, open.rank), payments.required_balance(priced.price, payments.session_fee(p_user, open.rank))
+  FROM priced, open;
+$$;
+
+
+ALTER FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."session_rank"("p_session" "uuid") RETURNS integer
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT count(*)::integer
+  FROM payments.sessions s
+  JOIN payments.sessions o ON o.user_id = s.user_id AND o.ended_at IS NULL AND o.id <> s.id
+  WHERE s.id = p_session AND (o.started_at, o.id) < (s.started_at, s.id);
+$$;
+
+
+ALTER FUNCTION "payments"."session_rank"("p_session" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."settle_payment"("p_payment" "uuid") RETURNS boolean
@@ -601,7 +1043,7 @@ BEGIN
 
   UPDATE payments.payments SET status = 'paid', paid_at = now() WHERE id = p_payment;
 
-  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.credits, p_payment);
+  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.credits, p_payment, NULL, NULL, NULL, NULL, NULL, v_payment.bonus);
 
   RETURN true;
 END;
@@ -611,7 +1053,7 @@ $$;
 ALTER FUNCTION "payments"."settle_payment"("p_payment" "uuid") OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text")
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint)
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -624,6 +1066,9 @@ DECLARE
   v_files text[];
   v_entry text;
   v_id uuid;
+  v_rank integer;
+  v_fee bigint;
+  v_required bigint;
 BEGIN
   IF profiles.is_banned(p_user) THEN
     RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
@@ -650,8 +1095,12 @@ BEGIN
     ELSE v_listed_price
   END;
 
-  IF v_price > 0 AND COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = p_user), 0)
-                     < payments.required_balance(v_price) THEN
+  -- the new session ranks after every open one, and an extra instance pays the fee even on a free script
+  SELECT count(*)::integer INTO v_rank FROM payments.sessions s WHERE s.user_id = p_user AND s.ended_at IS NULL;
+  v_fee := payments.session_fee(p_user, v_rank);
+  v_required := payments.required_balance(v_price, v_fee);
+
+  IF v_required > 0 AND COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = p_user), 0) < v_required THEN
     RAISE EXCEPTION 'insufficient credits' USING ERRCODE = 'check_violation';
   END IF;
 
@@ -659,12 +1108,40 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee;
 END;
 $$;
 
 
 ALTER FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."stop_session"("p_session" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.sessions WHERE id = p_session FOR UPDATE;
+
+  IF NOT FOUND OR auth.uid() IS NULL
+     OR NOT (v_session.user_id = auth.uid() OR profiles.min_role(auth.uid(), 'moderator'::profiles.roles)) THEN
+    RAISE EXCEPTION 'not allowed' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  PERFORM payments.end_session(p_session, 'stopped');
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."stop_session"("p_session" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."tr_accounts_pre_delete"() RETURNS "trigger"
@@ -1204,10 +1681,6 @@ $$;
 
 
 ALTER FUNCTION "public"."webhook"() OWNER TO "supabase_admin";
-
-SET default_tablespace = '';
-
-SET default_table_access_method = "heap";
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."scripts" (
@@ -2294,6 +2767,25 @@ $$;
 ALTER FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience" bigint, "p_gold" bigint, "p_minutes" numeric, "p_custom" bigint[]) OWNER TO "supabase_admin";
 
 
+CREATE TABLE IF NOT EXISTS "feedback"."scores" (
+    "script_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "session_id" "uuid" NOT NULL,
+    "revision" integer NOT NULL,
+    "score" smallint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "scores_score_check" CHECK ((("score" >= 1) AND ("score" <= 10)))
+);
+
+
+ALTER TABLE "feedback"."scores" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "feedback"."scores" IS 'Internal 1-10 scores. Written only by feedback.score_session; authors see aggregates through feedback.score_summary.';
+
+
+
 CREATE TABLE IF NOT EXISTS "info"."acceptances" (
     "user_id" "uuid" NOT NULL,
     "version" integer NOT NULL,
@@ -2321,6 +2813,8 @@ CREATE TABLE IF NOT EXISTS "payments"."accounts" (
     "credits" bigint DEFAULT 0 NOT NULL,
     "earnings" bigint DEFAULT 0 NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "bonus_credits" bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT "accounts_bonus_credits_check" CHECK ((("bonus_credits" >= 0) AND ("bonus_credits" <= "credits"))),
     CONSTRAINT "accounts_credits_check" CHECK (("credits" >= 0)),
     CONSTRAINT "accounts_earnings_check" CHECK (("earnings" >= 0))
 );
@@ -2329,12 +2823,18 @@ CREATE TABLE IF NOT EXISTS "payments"."accounts" (
 ALTER TABLE "payments"."accounts" OWNER TO "supabase_admin";
 
 
+COMMENT ON COLUMN "payments"."accounts"."bonus_credits" IS 'The part of credits that came from top-up bonuses. Spent in the same proportion as the balance holds it, and the author''s share on that part is not paid out.';
+
+
+
 CREATE TABLE IF NOT EXISTS "payments"."config" (
     "id" boolean DEFAULT true NOT NULL,
     "platform_fee_bps" integer DEFAULT 2000 NOT NULL,
     "session_timeout_minutes" integer DEFAULT 5 NOT NULL,
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
+    "extra_session_fee" bigint DEFAULT 30000 NOT NULL,
     CONSTRAINT "config_check" CHECK ((("session_timeout_minutes" > 0) AND ("min_balance_minutes" > 0))),
+    CONSTRAINT "config_extra_session_fee_check" CHECK (("extra_session_fee" >= 0)),
     CONSTRAINT "config_fee_check" CHECK ((("platform_fee_bps" >= 0) AND ("platform_fee_bps" <= 10000))),
     CONSTRAINT "config_singleton" CHECK ("id")
 );
@@ -2355,6 +2855,10 @@ COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs 
 
 
 
+COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Credits every extra concurrent session of an account costs per 30 days of running (30000 = 1 EUR x 3). The oldest open session is free, and tester+ pay no fee.';
+
+
+
 CREATE TABLE IF NOT EXISTS "payments"."credits_ledger" (
     "id" bigint NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -2368,11 +2872,23 @@ CREATE TABLE IF NOT EXISTS "payments"."credits_ledger" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "session_id" "uuid",
     "granted_by" "uuid",
-    CONSTRAINT "credits_ledger_amount_check" CHECK (("amount" <> 0))
+    "fee" bigint DEFAULT 0 NOT NULL,
+    "bonus" bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT "credits_ledger_amount_check" CHECK (("amount" <> 0)),
+    CONSTRAINT "credits_ledger_bonus_check" CHECK ((("abs"("bonus") <= "abs"("amount")) AND (("bonus" = 0) OR ("sign"(("bonus")::double precision) = "sign"(("amount")::double precision))))),
+    CONSTRAINT "credits_ledger_fee_check" CHECK ((("fee" >= 0) AND (("fee" = 0) OR ("fee" <= (- "amount")))))
 );
 
 
 ALTER TABLE "payments"."credits_ledger" OWNER TO "supabase_admin";
+
+
+COMMENT ON COLUMN "payments"."credits_ledger"."fee" IS 'The part of a usage charge that is the extra-session fee; the rest is the script''s price.';
+
+
+
+COMMENT ON COLUMN "payments"."credits_ledger"."bonus" IS 'The part of amount that moved bonus credits, with the sign of amount.';
+
 
 
 ALTER TABLE "payments"."credits_ledger" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
@@ -2397,11 +2913,17 @@ CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
     "note" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "session_id" "uuid",
-    CONSTRAINT "earnings_ledger_amount_check" CHECK (("amount" <> 0))
+    "bonus" bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT "earnings_ledger_amount_check" CHECK ((("amount" <> 0) OR ("bonus" > 0))),
+    CONSTRAINT "earnings_ledger_bonus_check" CHECK (("bonus" >= 0))
 );
 
 
 ALTER TABLE "payments"."earnings_ledger" OWNER TO "supabase_admin";
+
+
+COMMENT ON COLUMN "payments"."earnings_ledger"."bonus" IS 'The part of a sale''s share that was not paid because the buyer paid with bonus credits.';
+
 
 
 ALTER TABLE "payments"."earnings_ledger" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
@@ -2449,32 +2971,6 @@ COMMENT ON COLUMN "payments"."payments"."amount" IS 'Amount paid, in the minor u
 
 
 COMMENT ON COLUMN "payments"."payments"."bonus" IS 'Part of credits that is a top-up bonus rather than bought with amount.';
-
-
-
-CREATE TABLE IF NOT EXISTS "payments"."sessions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "script_id" "uuid" NOT NULL,
-    "author_id" "uuid" NOT NULL,
-    "revision" integer NOT NULL,
-    "price" bigint NOT NULL,
-    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "last_seen" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "charged_until" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "ended_at" timestamp with time zone,
-    "unpaid" bigint DEFAULT 0 NOT NULL,
-    "end_reason" "payments"."session_end",
-    CONSTRAINT "sessions_end_check" CHECK ((("ended_at" IS NULL) = ("end_reason" IS NULL))),
-    CONSTRAINT "sessions_price_check" CHECK (("price" >= 0)),
-    CONSTRAINT "sessions_unpaid_check" CHECK (("unpaid" >= 0))
-);
-
-
-ALTER TABLE "payments"."sessions" OWNER TO "supabase_admin";
-
-
-COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover.';
 
 
 
@@ -2827,6 +3323,16 @@ CREATE TABLE IF NOT EXISTS "stats"."website_monthly" (
 ALTER TABLE "stats"."website_monthly" OWNER TO "supabase_admin";
 
 
+ALTER TABLE ONLY "feedback"."reports"
+    ADD CONSTRAINT "reports_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "feedback"."scores"
+    ADD CONSTRAINT "scores_pkey" PRIMARY KEY ("script_id", "user_id");
+
+
+
 ALTER TABLE ONLY "info"."acceptances"
     ADD CONSTRAINT "acceptances_pkey" PRIMARY KEY ("user_id", "kind", "version");
 
@@ -2992,6 +3498,22 @@ ALTER TABLE ONLY "stats"."website"
 
 
 
+CREATE INDEX "reports_assigned_to_idx" ON "feedback"."reports" USING "btree" ("assigned_to") WHERE ("assigned_to" IS NOT NULL);
+
+
+
+CREATE INDEX "reports_attachments_idx" ON "feedback"."reports" USING "btree" ("created_at") WHERE (("log" IS NOT NULL) OR ("snapshot" IS NOT NULL) OR ("diagnostics" IS NOT NULL));
+
+
+
+CREATE INDEX "reports_script_id_idx" ON "feedback"."reports" USING "btree" ("script_id", "created_at" DESC);
+
+
+
+CREATE INDEX "reports_user_id_idx" ON "feedback"."reports" USING "btree" ("user_id", "created_at" DESC);
+
+
+
 CREATE INDEX "credits_ledger_adjustments_idx" ON "payments"."credits_ledger" USING "btree" ("id" DESC) WHERE ("kind" = 'adjustment'::"payments"."credit_kind");
 
 
@@ -3049,6 +3571,10 @@ CREATE INDEX "slugs_id_idx" ON "scripts"."slugs" USING "btree" ("id");
 
 
 CREATE UNIQUE INDEX "versions_one_pending_idx" ON "scripts"."versions" USING "btree" ("id") WHERE ("status" = 'pending'::"scripts"."version_status");
+
+
+
+CREATE OR REPLACE TRIGGER "tr_reports_pre_update" BEFORE UPDATE ON "feedback"."reports" FOR EACH ROW EXECUTE FUNCTION "feedback"."tr_reports_pre_update"();
 
 
 
@@ -3141,6 +3667,41 @@ CREATE OR REPLACE TRIGGER "tr_versions_pre_insert" BEFORE INSERT ON "scripts"."v
 
 
 CREATE OR REPLACE TRIGGER "wh-scripts.versions" AFTER UPDATE OF "status" ON "scripts"."versions" FOR EACH ROW WHEN (("new"."status" = 'live'::"scripts"."version_status")) EXECUTE FUNCTION "public"."webhook"();
+
+
+
+ALTER TABLE ONLY "feedback"."reports"
+    ADD CONSTRAINT "reports_assigned_to_fkey" FOREIGN KEY ("assigned_to") REFERENCES "profiles"."profiles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "feedback"."reports"
+    ADD CONSTRAINT "reports_script_id_fkey" FOREIGN KEY ("script_id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "feedback"."reports"
+    ADD CONSTRAINT "reports_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "payments"."sessions"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "feedback"."reports"
+    ADD CONSTRAINT "reports_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "feedback"."scores"
+    ADD CONSTRAINT "scores_script_id_fkey" FOREIGN KEY ("script_id") REFERENCES "scripts"."scripts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "feedback"."scores"
+    ADD CONSTRAINT "scores_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "payments"."sessions"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "feedback"."scores"
+    ADD CONSTRAINT "scores_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
 
 
 
@@ -3282,6 +3843,28 @@ ALTER TABLE ONLY "stats"."website"
 ALTER TABLE ONLY "stats"."website_monthly"
     ADD CONSTRAINT "website_monthly_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON UPDATE CASCADE ON DELETE CASCADE;
 
+
+
+CREATE POLICY "DELETE for OWNER and MODERATOR" ON "feedback"."reports" FOR DELETE TO "authenticated" USING ((("user_id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
+
+
+
+CREATE POLICY "SELECT for ALLOWED" ON "feedback"."reports" FOR SELECT TO "authenticated" USING ("feedback"."can_view_report"("reports".*));
+
+
+
+CREATE POLICY "SELECT for OWNER and MODERATOR" ON "feedback"."scores" FOR SELECT TO "authenticated" USING ((("user_id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles")));
+
+
+
+CREATE POLICY "UPDATE for ALLOWED" ON "feedback"."reports" FOR UPDATE TO "authenticated" USING ("feedback"."can_manage_report"("reports".*)) WITH CHECK ("feedback"."can_manage_report"("reports".*));
+
+
+
+ALTER TABLE "feedback"."reports" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "feedback"."scores" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "INSERT for ADMINISTRATOR" ON "info"."documents" FOR INSERT TO "authenticated" WITH CHECK ("profiles"."is_role"('administrator'::"profiles"."roles"));
@@ -3534,6 +4117,12 @@ ALTER TABLE "stats"."website" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "stats"."website_monthly" ENABLE ROW LEVEL SECURITY;
 
 
+GRANT USAGE ON SCHEMA "feedback" TO "authenticated";
+GRANT ALL ON SCHEMA "feedback" TO "postgres";
+GRANT USAGE ON SCHEMA "feedback" TO "service_role";
+
+
+
 GRANT USAGE ON SCHEMA "info" TO "anon";
 GRANT USAGE ON SCHEMA "info" TO "authenticated";
 GRANT USAGE ON SCHEMA "info" TO "service_role";
@@ -3570,11 +4159,105 @@ GRANT USAGE ON SCHEMA "stats" TO "service_role";
 
 
 
+GRANT ALL ON TYPE "feedback"."report_status" TO "postgres";
+
+
+
 GRANT ALL ON TYPE "payments"."session_end" TO "postgres";
 
 
 
 GRANT ALL ON TYPE "scripts"."version_status" TO "postgres";
+
+
+
+GRANT SELECT,DELETE ON TABLE "feedback"."reports" TO "authenticated";
+GRANT ALL ON TABLE "feedback"."reports" TO "postgres";
+GRANT ALL ON TABLE "feedback"."reports" TO "service_role";
+
+
+
+GRANT UPDATE("assigned_to") ON TABLE "feedback"."reports" TO "authenticated";
+
+
+
+GRANT UPDATE("status") ON TABLE "feedback"."reports" TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") TO "authenticated";
+GRANT ALL ON FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."can_manage_report"("r" "feedback"."reports") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") TO "authenticated";
+GRANT ALL ON FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."can_view_report"("r" "feedback"."reports") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."clear_old_attachments"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."clear_old_attachments"() TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."clear_old_attachments"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."list_reports"("p_script" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."list_reports"("p_script" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "feedback"."list_reports"("p_script" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."list_reports"("p_script" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."list_testers"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."list_testers"() TO "authenticated";
+GRANT ALL ON FUNCTION "feedback"."list_testers"() TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."list_testers"() TO "service_role";
+
+
+
+GRANT SELECT ON TABLE "payments"."sessions" TO "authenticated";
+GRANT ALL ON TABLE "payments"."sessions" TO "postgres";
+GRANT SELECT ON TABLE "payments"."sessions" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."recent_session"("p_user" "uuid", "p_session" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."recent_session"("p_user" "uuid", "p_session" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."recent_session"("p_user" "uuid", "p_session" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."recent_sessions"("p_user" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."recent_sessions"("p_user" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."recent_sessions"("p_user" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."report_session"("p_user" "uuid", "p_session" "uuid", "p_description" "text", "p_log" "text", "p_snapshot" "jsonb", "p_diagnostics" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."report_session"("p_user" "uuid", "p_session" "uuid", "p_description" "text", "p_log" "text", "p_snapshot" "jsonb", "p_diagnostics" "jsonb") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."report_session"("p_user" "uuid", "p_session" "uuid", "p_description" "text", "p_log" "text", "p_snapshot" "jsonb", "p_diagnostics" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."score_session"("p_user" "uuid", "p_session" "uuid", "p_score" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."score_session"("p_user" "uuid", "p_session" "uuid", "p_score" integer) TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."score_session"("p_user" "uuid", "p_session" "uuid", "p_score" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."score_summary"("p_script" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."score_summary"("p_script" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "feedback"."score_summary"("p_script" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "feedback"."score_summary"("p_script" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "feedback"."tr_reports_pre_update"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "feedback"."tr_reports_pre_update"() TO "postgres";
 
 
 
@@ -3627,19 +4310,50 @@ GRANT ALL ON FUNCTION "payments"."heartbeat_session"("p_session" "uuid") TO "ser
 
 
 
-REVOKE ALL ON FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "payments"."minutes_per_month"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."minutes_per_month"() TO "postgres";
+GRANT ALL ON FUNCTION "payments"."minutes_per_month"() TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid") TO "postgres";
-GRANT ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid", "p_bonus" bigint, "p_fee" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid", "p_bonus" bigint, "p_fee" bigint) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."post_credits"("p_user" "uuid", "p_kind" "payments"."credit_kind", "p_amount" bigint, "p_payment" "uuid", "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_actor" "uuid", "p_bonus" bigint, "p_fee" bigint) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_bonus" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_bonus" bigint) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."post_earnings"("p_user" "uuid", "p_kind" "payments"."earning_kind", "p_amount" bigint, "p_script" "uuid", "p_minutes" integer, "p_note" "text", "p_session" "uuid", "p_bonus" bigint) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "payments"."required_balance"("p_price" bigint) FROM PUBLIC;
 GRANT ALL ON FUNCTION "payments"."required_balance"("p_price" bigint) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."session_rank"("p_session" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."session_rank"("p_session" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "payments"."session_rank"("p_session" "uuid") TO "service_role";
 
 
 
@@ -3649,7 +4363,15 @@ GRANT ALL ON FUNCTION "payments"."settle_payment"("p_payment" "uuid") TO "servic
 
 
 REVOKE ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") TO "postgres";
 GRANT ALL ON FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."stop_session"("p_session" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."stop_session"("p_session" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "payments"."stop_session"("p_session" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "payments"."stop_session"("p_session" "uuid") TO "service_role";
 
 
 
@@ -4086,6 +4808,12 @@ GRANT ALL ON FUNCTION "stats"."report_session"("p_session" "uuid", "p_experience
 
 
 
+GRANT SELECT ON TABLE "feedback"."scores" TO "authenticated";
+GRANT ALL ON TABLE "feedback"."scores" TO "postgres";
+GRANT ALL ON TABLE "feedback"."scores" TO "service_role";
+
+
+
 GRANT SELECT ON TABLE "info"."acceptances" TO "authenticated";
 GRANT ALL ON TABLE "info"."acceptances" TO "postgres";
 GRANT ALL ON TABLE "info"."acceptances" TO "service_role";
@@ -4127,12 +4855,6 @@ GRANT SELECT ON TABLE "payments"."earnings_ledger" TO "service_role";
 
 GRANT SELECT ON TABLE "payments"."payments" TO "authenticated";
 GRANT ALL ON TABLE "payments"."payments" TO "service_role";
-
-
-
-GRANT SELECT ON TABLE "payments"."sessions" TO "authenticated";
-GRANT ALL ON TABLE "payments"."sessions" TO "postgres";
-GRANT SELECT ON TABLE "payments"."sessions" TO "service_role";
 
 
 
