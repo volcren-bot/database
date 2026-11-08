@@ -370,9 +370,11 @@ CREATE TABLE IF NOT EXISTS "payments"."sessions" (
     "end_reason" "payments"."session_end",
     "fee_accrued" bigint DEFAULT 0 NOT NULL,
     "fee_charged" bigint DEFAULT 0 NOT NULL,
+    "share_accrued" bigint DEFAULT 0 NOT NULL,
     CONSTRAINT "sessions_end_check" CHECK ((("ended_at" IS NULL) = ("end_reason" IS NULL))),
     CONSTRAINT "sessions_fee_check" CHECK ((("fee_accrued" >= 0) AND ("fee_charged" >= 0))),
     CONSTRAINT "sessions_price_check" CHECK (("price" >= 0)),
+    CONSTRAINT "sessions_share_check" CHECK ((("share_accrued" >= 0) AND ("share_accrued" < 10000))),
     CONSTRAINT "sessions_unpaid_check" CHECK (("unpaid" >= 0))
 );
 
@@ -380,7 +382,7 @@ CREATE TABLE IF NOT EXISTS "payments"."sessions" (
 ALTER TABLE "payments"."sessions" OWNER TO "supabase_admin";
 
 
-COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in credit-minutes (a credit is charged per 43200), fee_charged the fee credits charged so far.';
+COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in credit-minutes (a credit is charged per 43200), fee_charged the fee credits charged so far. share_accrued is the author''s share not yet paid, in 1/10000 credits: a whole credit is paid once it adds up.';
 
 
 
@@ -647,6 +649,7 @@ DECLARE
   v_charged bigint;
   v_fee_paid bigint;
   v_bonus bigint;
+  v_share_accrued bigint;
   v_share bigint;
   v_lost bigint;
 BEGIN
@@ -701,8 +704,10 @@ BEGIN
     UPDATE payments.sessions SET fee_charged = fee_charged + v_fee_paid WHERE id = p_session;
   END IF;
 
-  -- the author's share is of the script's part only, and the part paid with bonus credits is lost, not paid
-  v_share := (v_charged - v_fee_paid) * (10000 - (SELECT platform_fee_bps FROM payments.config)) / 10000;
+  -- the author's share is of the script's part only, with fractions of a credit carried; the part paid with bonus credits is lost
+  v_share_accrued := v_session.share_accrued + (v_charged - v_fee_paid) * (10000 - (SELECT platform_fee_bps FROM payments.config));
+  v_share := v_share_accrued / 10000;
+  UPDATE payments.sessions SET share_accrued = v_share_accrued % 10000 WHERE id = p_session;
   v_lost := v_share * v_bonus / v_charged;
 
   -- a deleted author has no account: the platform keeps the share
