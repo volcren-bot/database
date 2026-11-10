@@ -93,8 +93,8 @@ SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000003', '10000000-000
 SELECT is(scripts.can_view('00000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002'), true, 'but the author can view it');
 
 -- price limits
-SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 23 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
-SELECT lives_ok($$UPDATE scripts.metadata SET type = 'premium', price = 22 WHERE id = '10000000-0000-0000-0000-000000000002'$$, 'the maximum price is allowed');
+SELECT throws_ok($$UPDATE scripts.metadata SET type = 'premium', price = 134401 WHERE id = '10000000-0000-0000-0000-000000000002'$$, '23514', NULL, 'a price above the maximum is rejected');
+SELECT lives_ok($$UPDATE scripts.metadata SET type = 'premium', price = 134400 WHERE id = '10000000-0000-0000-0000-000000000002'$$, 'the maximum price is allowed');
 
 -- entry file
 SELECT is((SELECT entry FROM scripts.versions WHERE id = '10000000-0000-0000-0000-000000000001' AND revision = 3), 'main.luau', 'a single file is the entry');

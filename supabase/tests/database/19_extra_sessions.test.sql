@@ -40,16 +40,17 @@ CREATE FUNCTION pg_temp.older(p_session uuid, p_by interval) RETURNS void LANGUA
 $$;
 
 CREATE FUNCTION pg_temp.credits(p_user uuid) RETURNS bigint LANGUAGE sql AS $$
-  SELECT credits FROM payments.accounts WHERE user_id = p_user;
+  SELECT microcredits FROM payments.accounts WHERE user_id = p_user;
 $$;
 
+UPDATE payments.config SET extra_session_fee = 30000;
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000001', 'author', 'scripter');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'farmer');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'tester', 'tester');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'bonus');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000005', 'poor');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000006', 'admin', 'administrator');
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 10);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 600);
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 0);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 100000);
 
@@ -57,12 +58,12 @@ CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, rank int, fee bigint);
 
 -- the quote and the rank
 SELECT results_eq($$SELECT price, rank, fee, required FROM payments.session_quote('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001')$$,
-  $$VALUES (10::bigint, 0, 0::bigint, 10::bigint)$$, 'the first instance is quoted at the script price with no fee');
+  $$VALUES (600::bigint, 0, 0::bigint, 10::bigint)$$, 'the first instance is quoted at the script price with no fee');
 INSERT INTO s SELECT 'a', session_id, rank, fee FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.older((SELECT id FROM s WHERE name = 'a'), interval '3 seconds');
 SELECT is((SELECT (rank, fee) FROM s WHERE name = 'a'), (0, 0::bigint), 'start_session returns rank 0 and no fee for the first session');
 SELECT results_eq($$SELECT price, rank, fee, required FROM payments.session_quote('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001')$$,
-  $$VALUES (10::bigint, 1, 30000::bigint, 11::bigint)$$, 'the second instance is quoted with the monthly fee and a credit more of balance');
+  $$VALUES (600::bigint, 1, 30000::bigint, 11::bigint)$$, 'the second instance is quoted with the monthly fee and a credit more of balance');
 INSERT INTO s SELECT 'b', session_id, rank, fee FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.older((SELECT id FROM s WHERE name = 'b'), interval '2 seconds');
 INSERT INTO s SELECT 'c', session_id, rank, fee FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002');
@@ -135,40 +136,40 @@ SELECT is((SELECT count(*) FROM payments.credits_ledger WHERE user_id = '0000000
 SELECT payments.end_user_sessions('00000000-0000-0000-0000-000000000003');
 
 -- bonus credits: a top-up with a bonus is remembered, spent in proportion, and the author's share on it is lost
-INSERT INTO payments.payments (id, user_id, provider, provider_id, credits, bonus, amount)
+INSERT INTO payments.payments (id, user_id, provider, provider_id, microcredits, bonus, amount)
 VALUES ('20000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000004', 'bitcart', 'inv-1', 11000, 1000, 1000);
 SELECT payments.settle_payment('20000000-0000-0000-0000-000000000001');
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (11000::bigint, 1000::bigint), 'settling a payment records its bonus');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (11000::bigint, 1000::bigint), 'settling a payment records its bonus');
 SELECT is((SELECT bonus FROM payments.credits_ledger WHERE payment_id = '20000000-0000-0000-0000-000000000001'), 1000::bigint, 'and the ledger row carries it');
 INSERT INTO s SELECT 'k', session_id, rank, fee FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.older((SELECT id FROM s WHERE name = 'k'), interval '5 seconds');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'k'), interval '100 minutes');
 SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'k'));
 SELECT is((SELECT (amount, bonus) FROM payments.credits_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'k')), (-1000::bigint, -90::bigint), '1000 credits spent from a balance that is 1/11 bonus take 90 bonus credits');
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10000::bigint, 910::bigint), 'the account keeps the rest');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10000::bigint, 910::bigint), 'the account keeps the rest');
 SELECT is((SELECT (amount, bonus) FROM payments.earnings_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'k')), (728::bigint, 72::bigint), 'the author is paid 800 less the 9% paid with bonus, which is recorded as lost');
 SELECT is((SELECT earnings FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001'), (23040 + 728)::bigint, 'and the earnings balance moved by the paid part only: two days of the second instance and this sale');
 SELECT payments.end_session((SELECT id FROM s WHERE name = 'k'), 'stopped');
 
 -- other spending takes bonus credits in proportion too, gains bring none
 SELECT payments.adjust_credits('00000000-0000-0000-0000-000000000006', '00000000-0000-0000-0000-000000000004', -1000, 'test');
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (9000::bigint, 819::bigint), 'an adjustment down takes its share of bonus credits');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (9000::bigint, 819::bigint), 'an adjustment down takes its share of bonus credits');
 SELECT payments.adjust_credits('00000000-0000-0000-0000-000000000006', '00000000-0000-0000-0000-000000000004', 1000, 'test');
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10000::bigint, 819::bigint), 'an adjustment up adds no bonus');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10000::bigint, 819::bigint), 'an adjustment up adds no bonus');
 SELECT payments.post_earnings('00000000-0000-0000-0000-000000000004', 'adjustment', 500);
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000004","role":"authenticated"}', true);
 SELECT payments.transfer_earnings(500);
 SELECT set_config('request.jwt.claims', '', true);
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10500::bigint, 819::bigint), 'earnings moved to credits are not bonus');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10500::bigint, 819::bigint), 'earnings moved to credits are not bonus');
 
 -- a share that is all bonus is recorded with a zero amount
-UPDATE payments.accounts SET bonus_credits = credits WHERE user_id = '00000000-0000-0000-0000-000000000004';
+UPDATE payments.accounts SET bonus_microcredits = microcredits WHERE user_id = '00000000-0000-0000-0000-000000000004';
 INSERT INTO s SELECT 'm', session_id, rank, fee FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.older((SELECT id FROM s WHERE name = 'm'), interval '4 seconds');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'm'), interval '10 minutes');
 SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'm'));
 SELECT is((SELECT (amount, bonus) FROM payments.earnings_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'm')), (0::bigint, 80::bigint), 'a sale paid entirely with bonus credits pays the author nothing and records the whole share as lost');
-SELECT is((SELECT (credits, bonus_credits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10400::bigint, 10400::bigint), 'and the balance stays all bonus');
+SELECT is((SELECT (microcredits, bonus_microcredits) FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), (10400::bigint, 10400::bigint), 'and the balance stays all bonus');
 SELECT payments.end_session((SELECT id FROM s WHERE name = 'm'), 'stopped');
 
 -- the fee is config

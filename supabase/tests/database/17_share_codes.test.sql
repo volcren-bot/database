@@ -82,7 +82,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000006', 'cauthor');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000007', 'friend2');
 
 -- an official, premium script and a community one
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 10);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 600);
 GRANT INSERT ("id") ON TABLE scripts.scripts TO authenticated;
 INSERT INTO info.documents (kind, content) VALUES ('scripter_tos', 't'), ('community_tos', 'c');
 SELECT pg_temp.accept('00000000-0000-0000-0000-000000000001');

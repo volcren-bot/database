@@ -34,7 +34,7 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'admin2', 'adminis
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'mod', 'moderator');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'user');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000005', 'author', 'scripter');
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 10);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 600);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 1000);
 
 -- who can ban whom
@@ -64,7 +64,7 @@ SELECT results_eq(
   $$VALUES ('00000000-0000-0000-0000-000000000001'::uuid, '00000000-0000-0000-0000-000000000004'::uuid, true, 'spam')$$,
   'the ban is recorded with the administrator and the trimmed reason');
 SELECT is((SELECT end_reason FROM payments.sessions WHERE id = (SELECT id FROM s)), 'stopped'::payments.session_end, 'the user''s running session is ended');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), 970::bigint, 'and charged for the minutes it ran');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), 970::bigint, 'and charged for the minutes it ran');
 SELECT is(profiles.set_banned('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000004', true, 'again'), false,
   'banning a banned user changes nothing');
 SELECT is((SELECT count(*)::int FROM profiles.bans), 1, 'and records nothing');

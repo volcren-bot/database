@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(42);
+SELECT plan(45);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -39,9 +39,11 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000001', 'author', 'scripte
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'payer');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000003', 'tester', 'tester');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000004', 'broke');
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 10);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 600);
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 0);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 1);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 60);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001', 100);
+UPDATE payments.config SET extra_session_fee = 30000;
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 9);
 
@@ -51,17 +53,17 @@ CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[],
 INSERT INTO s SELECT 'a', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT is((SELECT revision FROM s WHERE name = 'a'), 1, 'start_session returns the live revision');
 SELECT is((SELECT files FROM s WHERE name = 'a'), ARRAY['main.luau'], 'and its files');
-SELECT is((SELECT price FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'a')), 10::bigint, 'the session stores the price');
+SELECT is((SELECT price FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'a')), 600::bigint, 'the session stores the price');
 SELECT is(stats.online_count(), 1::bigint, 'an open session counts as online');
 SELECT throws_ok($$SELECT payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'a balance below one minute cannot start a session');
 
 -- a price change during a session does not change what that session pays
-UPDATE scripts.metadata SET price = 20 WHERE id = '10000000-0000-0000-0000-000000000001';
+UPDATE scripts.metadata SET price = 1200 WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'a'), interval '5 minutes');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), true, 'a heartbeat charges the elapsed minutes and keeps the session running');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 950::bigint, 'the session pays its own price (5 x 10), not the new one');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 950::bigint, 'the session pays its own price (5 x 10), not the new one');
 
-UPDATE scripts.metadata SET price = 10 WHERE id = '10000000-0000-0000-0000-000000000001';
+UPDATE scripts.metadata SET price = 600 WHERE id = '10000000-0000-0000-0000-000000000001';
 
 -- 10 minutes charged by heartbeats + the remaining 2 minutes at the end
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'a'), interval '5 minutes');
@@ -70,7 +72,7 @@ SELECT is((SELECT count(*)::int FROM payments.credits_ledger WHERE kind = 'usage
 SELECT is((SELECT sum(minutes)::int FROM payments.credits_ledger WHERE kind = 'usage' AND session_id = (SELECT id FROM s WHERE name = 'a')), 10, 'covering 10 minutes');
 UPDATE payments.sessions SET last_seen = charged_until + interval '2 minutes' WHERE id = (SELECT id FROM s WHERE name = 'a');
 SELECT is(payments.end_session((SELECT id FROM s WHERE name = 'a'), 'stopped'), 20::bigint, 'end_session charges the remaining 2 minutes');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 880::bigint, '12 minutes cost 120 credits');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 880::bigint, '12 minutes cost 120 credits');
 SELECT is((SELECT earnings FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001'), 96::bigint, 'the author gets 80% of it');
 SELECT is(payments.end_session((SELECT id FROM s WHERE name = 'a'), 'stopped'), 0::bigint, 'end_session is idempotent');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'a')), false, 'a heartbeat on an ended session says stop');
@@ -88,16 +90,28 @@ SELECT payments.end_session((SELECT id FROM s WHERE name = 'b'), 'stopped');
 INSERT INTO s SELECT 'c', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000003');
 SELECT is(payments.end_session((SELECT id FROM s WHERE name = 'c'), 'stopped'), 1::bigint, 'a run shorter than a minute is billed one minute');
 
+INSERT INTO s SELECT 'r', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000004');
+SELECT pg_temp.age((SELECT id FROM s WHERE name = 'r'), interval '1 minute');
+SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'r'));
+SELECT is((SELECT sum(amount) FROM payments.credits_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'r')), -2::numeric, 'the first minute at 100 an hour costs 2, rounded up');
+SELECT pg_temp.age((SELECT id FROM s WHERE name = 'r'), interval '2 minutes');
+SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'r'));
+SELECT is((SELECT sum(amount) FROM payments.credits_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'r')), -5::numeric, 'three minutes cost 5 in all, the running total rounded up');
+SELECT pg_temp.age((SELECT id FROM s WHERE name = 'r'), interval '57 minutes');
+SELECT payments.heartbeat_session((SELECT id FROM s WHERE name = 'r'));
+SELECT is((SELECT sum(amount) FROM payments.credits_ledger WHERE session_id = (SELECT id FROM s WHERE name = 'r')), -100::numeric, 'an hour costs exactly the hourly price');
+SELECT payments.end_session((SELECT id FROM s WHERE name = 'r'), 'stopped');
+
 -- stops at a zero balance, the shortfall goes to unpaid
 INSERT INTO s SELECT 'd', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
-SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', -((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002') - 300));
+SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', -((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002') - 300));
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'd'), interval '5 minutes');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'd')), true, 'a charge the balance covers keeps the session running');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'd'), interval '5 minutes');
-SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', -((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002') - 40));
+SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', -((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002') - 40));
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'd')), false, 'the session is stopped when the balance cannot cover the next minute');
 SELECT is((SELECT end_reason::text FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'd')), 'insufficient_credits', 'with the matching reason');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 0::bigint, 'charging stops at a zero balance');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 0::bigint, 'charging stops at a zero balance');
 SELECT is((SELECT unpaid FROM payments.sessions WHERE id = (SELECT id FROM s WHERE name = 'd')), 10::bigint, 'and the shortfall is recorded in unpaid');
 
 -- free sessions
@@ -121,7 +135,7 @@ SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment
 INSERT INTO s SELECT 'h', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');
 SELECT pg_temp.age((SELECT id FROM s WHERE name = 'h'), interval '1 minute');
 SELECT is(payments.heartbeat_session((SELECT id FROM s WHERE name = 'h')), true, 'a heartbeat one minute in keeps the session running');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 990::bigint, 'and charges that minute');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000002'), 990::bigint, 'and charges that minute');
 
 -- the UI check and the session start agree on the minimum balance
 SELECT is(scripts.can_access('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001'), false, 'below one minute of credits a premium script is not accessible');
@@ -144,7 +158,7 @@ SELECT pg_temp.age((SELECT id FROM s WHERE name = 'm'), interval '6 minutes');
 UPDATE payments.accounts SET earnings = 0 WHERE user_id = '00000000-0000-0000-0000-000000000001';
 DELETE FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001';
 SELECT is(payments.end_stale_sessions(), 1, 'a stale session of a deleted author ends');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), 9::bigint, 'the user is charged the started minute');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000004'), 9::bigint, 'the user is charged the started minute');
 
 -- a folder that is not a uuid is a plain denial, not an error
 SET LOCAL ROLE authenticated;

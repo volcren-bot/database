@@ -92,10 +92,10 @@ CREATE TABLE IF NOT EXISTS "scripts"."metadata" (
     "stage" "scripts"."stage" DEFAULT 'prototype'::"scripts"."stage" NOT NULL,
     "price" bigint DEFAULT 0 NOT NULL,
     CONSTRAINT "metadata_price_check" CHECK (("price" >= 0) AND (("type" = 'free'::"scripts"."type") = ("price" = 0))),
-    CONSTRAINT "metadata_price_max_check" CHECK ("price" <= 22)
+    CONSTRAINT "metadata_price_max_check" CHECK ("price" <= 134400)
 );
 
-COMMENT ON COLUMN "scripts"."metadata"."price" IS 'Credits (1 credit = 0.01 cent EUR, 10,000 credits = 1 EUR) charged per minute of use. 0 for free scripts, 1 to 22 for premium ones: 22 a minute is about 98 EUR for a 31-day month of nonstop use, so no script costs more than 100 EUR a month. The maximum is a constant because a CHECK can''t read payments.config.';
+COMMENT ON COLUMN "scripts"."metadata"."price" IS 'Microcredits (1,000,000 = 1 CREDIT = 1 EUR) charged per hour of use, billed by the minute. 0 for free scripts, 1 to 134400 for premium ones: 134400 an hour is 99.99 EUR for a 31-day month of nonstop use, so no script costs more than 100 EUR a month. The maximum is a constant because a CHECK can''t read payments.config.';
 
 
 CREATE TABLE IF NOT EXISTS "scripts"."protected" (
@@ -578,7 +578,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_
                                                       AND (
                                                               sc.type <> 'premium'::scripts.type
                                                               OR v.role >= 'tester'::profiles.roles
-                                                              OR COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = accesser_id), 0) >= payments.required_balance(sc.price)
+                                                              OR COALESCE((SELECT a.microcredits FROM payments.accounts a WHERE a.user_id = accesser_id), 0) >= payments.required_balance(sc.price)
                                                       )
                                               )
                                       END

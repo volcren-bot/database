@@ -31,7 +31,7 @@ $$;
 
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000001', 'author', 'scripter');
 SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'user');
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 10);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 600);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 
 -- deleting a user ends and charges their running scripts

@@ -86,12 +86,12 @@ SELECT throws_ok($$UPDATE scripts.metadata SET stage = 'alpha' WHERE id = '10000
 RESET ROLE;
 
 -- ledgers and payments
-INSERT INTO payments.payments (id, user_id, provider, provider_id, credits, amount)
+INSERT INTO payments.payments (id, user_id, provider, provider_id, microcredits, amount)
 VALUES ('20000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'bitcart', 'inv-1', 50000, 500);
 
 SELECT is(payments.settle_payment('20000000-0000-0000-0000-000000000001'), true, 'settle_payment settles');
 SELECT is(payments.settle_payment('20000000-0000-0000-0000-000000000001'), false, 'settle_payment is idempotent');
-SELECT is((SELECT credits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001'), 50000::bigint, 'credits are granted once');
+SELECT is((SELECT microcredits FROM payments.accounts WHERE user_id = '00000000-0000-0000-0000-000000000001'), 50000::bigint, 'credits are granted once');
 
 SELECT payments.post_earnings('00000000-0000-0000-0000-000000000004', 'adjustment', 100);
 SET LOCAL ROLE authenticated;

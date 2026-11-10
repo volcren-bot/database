@@ -34,22 +34,22 @@ SELECT pg_temp.signup('00000000-0000-0000-0000-000000000002', 'buyer');
 SELECT is(payments.average_price(), NULL, 'no paid scripts: no average');
 
 -- Counted: paid, published, beta or stable, live
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', 10, 'stable', true);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', 20, 'beta', true);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000001', 600, 'stable', true);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000002', 1200, 'beta', true);
 -- Not counted
 SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000003', 0, 'stable', true);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000004', 22, 'stable', false);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000005', 5, 'prototype', true);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000006', 7, 'alpha', true);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000007', 3, 'archived', true);
-SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000008', 1, 'stable', true, false);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000004', 1320, 'stable', false);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000005', 300, 'prototype', true);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000006', 420, 'alpha', true);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000007', 180, 'archived', true);
+SELECT pg_temp.make_script('10000000-0000-0000-0000-000000000008', 60, 'stable', true, false);
 
-SELECT is(payments.average_price(), 15::numeric,
+SELECT is(payments.average_price(), 900::numeric,
   'only paid, published, beta or stable scripts with a live revision are averaged');
 
 SELECT set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000002","role":"authenticated"}', true);
 SET LOCAL ROLE authenticated;
-SELECT is(payments.average_price(), 15::numeric, 'a logged-in user gets the same average, unhidden by RLS');
+SELECT is(payments.average_price(), 900::numeric, 'a logged-in user gets the same average, unhidden by RLS');
 RESET ROLE;
 
 SET LOCAL ROLE anon;

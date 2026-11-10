@@ -40,7 +40,7 @@ SELECT throws_ok($$SELECT payments.adjust_credits('00000000-0000-0000-0000-00000
 
 -- Top-ups with a bonus
 
-INSERT INTO payments.payments (id, user_id, provider, provider_id, credits, bonus, amount)
+INSERT INTO payments.payments (id, user_id, provider, provider_id, microcredits, bonus, amount)
 VALUES ('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'bitcart', 'inv-1', 1065051, 65051, 10000);
 SELECT payments.settle_payment('10000000-0000-0000-0000-000000000001');
 
@@ -49,7 +49,7 @@ SELECT results_eq(
   $$VALUES ('topup', 1065051::bigint, '10000000-0000-0000-0000-000000000001'::uuid, NULL::uuid)$$,
   'a top-up credits the bonus too, links to its payment and has no granter');
 
-SELECT throws_ok($$INSERT INTO payments.payments (user_id, provider, provider_id, credits, bonus, amount)
+SELECT throws_ok($$INSERT INTO payments.payments (user_id, provider, provider_id, microcredits, bonus, amount)
   VALUES ('00000000-0000-0000-0000-000000000003', 'bitcart', 'inv-2', 1000, 1000, 100)$$,
   '23514', NULL, 'the bonus is part of the credits, not all of them');
 

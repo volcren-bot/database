@@ -12,7 +12,7 @@ END;
 $$;
 
 CREATE FUNCTION pg_temp.invoice(p_user uuid, p_n int) RETURNS void LANGUAGE sql AS $$
-  INSERT INTO payments.payments (user_id, provider, provider_id, credits, amount)
+  INSERT INTO payments.payments (user_id, provider, provider_id, microcredits, amount)
   VALUES (p_user, 'bitcart', 'inv-' || p_user || '-' || p_n, 5000000, 500);
 $$;
 

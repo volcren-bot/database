@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS "payments"."config" (
     "platform_fee_bps" integer DEFAULT 2000 NOT NULL,
     "session_timeout_minutes" integer DEFAULT 5 NOT NULL,
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
-    "extra_session_fee" bigint DEFAULT 30000 NOT NULL,
+    "extra_session_fee" bigint DEFAULT 3000000 NOT NULL,
     CONSTRAINT "config_singleton" CHECK ("id"),
     CONSTRAINT "config_extra_session_fee_check" CHECK ("extra_session_fee" >= 0),
     CONSTRAINT "config_fee_check" CHECK ("platform_fee_bps" BETWEEN 0 AND 10000),
@@ -41,22 +41,26 @@ COMMENT ON COLUMN "payments"."config"."platform_fee_bps" IS 'Platform cut of eac
 
 COMMENT ON COLUMN "payments"."config"."session_timeout_minutes" IS 'A session without a heartbeat for this long is ended with reason timeout.';
 
-COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs a balance covering this many minutes at its price to start and to keep running (see payments.required_balance).';
+COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs a balance covering this many minutes at its hourly price to start and to keep running (see payments.required_balance).';
 
-COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Credits every extra concurrent session of an account costs per 30 days of running (30000 = 1 EUR x 3). The oldest open session is free, and tester+ pay no fee.';
+COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Microcredits every extra concurrent session of an account costs per 30 days of running (3000000 = 3 EUR). The oldest open session is free, and tester+ pay no fee.';
 
 CREATE TABLE IF NOT EXISTS "payments"."accounts" (
     "user_id" "uuid" NOT NULL,
-    "credits" bigint DEFAULT 0 NOT NULL,
+    "microcredits" bigint DEFAULT 0 NOT NULL,
     "earnings" bigint DEFAULT 0 NOT NULL,
-    "bonus_credits" bigint DEFAULT 0 NOT NULL,
+    "bonus_microcredits" bigint DEFAULT 0 NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "accounts_credits_check" CHECK ("credits" >= 0),
+    CONSTRAINT "accounts_microcredits_check" CHECK ("microcredits" >= 0),
     CONSTRAINT "accounts_earnings_check" CHECK ("earnings" >= 0),
-    CONSTRAINT "accounts_bonus_credits_check" CHECK ("bonus_credits" >= 0 AND "bonus_credits" <= "credits")
+    CONSTRAINT "accounts_bonus_microcredits_check" CHECK ("bonus_microcredits" >= 0 AND "bonus_microcredits" <= "microcredits")
 );
 
-COMMENT ON COLUMN "payments"."accounts"."bonus_credits" IS 'The part of credits that came from top-up bonuses. Spent in the same proportion as the balance holds it, and the author''s share on that part is not paid out.';
+COMMENT ON COLUMN "payments"."accounts"."microcredits" IS 'Spendable balance in microcredits (1,000,000 = 1 CREDIT = 1 EUR).';
+
+COMMENT ON COLUMN "payments"."accounts"."earnings" IS 'Author earnings in microcredits, owed to the user.';
+
+COMMENT ON COLUMN "payments"."accounts"."bonus_microcredits" IS 'The part of microcredits that came from top-up bonuses. Spent in the same proportion as the balance holds it, and the author''s share on that part is not paid out.';
 
 
 CREATE TABLE IF NOT EXISTS "payments"."payments" (
@@ -65,22 +69,22 @@ CREATE TABLE IF NOT EXISTS "payments"."payments" (
     "provider" "payments"."provider" NOT NULL,
     "provider_id" "text" NOT NULL,
     "status" "payments"."payment_status" DEFAULT 'pending'::"payments"."payment_status" NOT NULL,
-    "credits" bigint NOT NULL,
+    "microcredits" bigint NOT NULL,
     "bonus" bigint DEFAULT 0 NOT NULL,
     "amount" bigint NOT NULL,
     "currency" "text" DEFAULT 'EUR'::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "paid_at" timestamp with time zone,
-    CONSTRAINT "payments_credits_check" CHECK ("credits" > 0),
+    CONSTRAINT "payments_microcredits_check" CHECK ("microcredits" > 0),
     CONSTRAINT "payments_amount_check" CHECK ("amount" > 0),
-    CONSTRAINT "payments_bonus_check" CHECK ("bonus" >= 0 AND "bonus" < "credits")
+    CONSTRAINT "payments_bonus_check" CHECK ("bonus" >= 0 AND "bonus" < "microcredits")
 );
 
-COMMENT ON COLUMN "payments"."payments"."credits" IS 'Credits granted when the payment settles, bonus included.';
+COMMENT ON COLUMN "payments"."payments"."microcredits" IS 'Microcredits granted when the payment settles, bonus included.';
 
-COMMENT ON COLUMN "payments"."payments"."bonus" IS 'Part of credits that is a top-up bonus rather than bought with amount.';
+COMMENT ON COLUMN "payments"."payments"."bonus" IS 'Part of microcredits that is a top-up bonus rather than bought with amount.';
 
-COMMENT ON COLUMN "payments"."payments"."amount" IS 'Amount paid, in the minor unit of currency (cents for EUR). Separate from credits so bonuses and other currencies stay possible.';
+COMMENT ON COLUMN "payments"."payments"."amount" IS 'Amount paid, in the minor unit of currency (cents for EUR). Separate from microcredits so bonuses and other currencies stay possible.';
 
 
 COMMENT ON TABLE "payments"."payments" IS 'Provider invoices (Bitcart now, others later). provider_id is the provider''s own invoice id.';
@@ -105,9 +109,11 @@ CREATE TABLE IF NOT EXISTS "payments"."credits_ledger" (
     CONSTRAINT "credits_ledger_bonus_check" CHECK (abs("bonus") <= abs("amount") AND ("bonus" = 0 OR sign("bonus") = sign("amount")))
 );
 
+COMMENT ON COLUMN "payments"."credits_ledger"."amount" IS 'Signed change to the balance, in microcredits.';
+
 COMMENT ON COLUMN "payments"."credits_ledger"."fee" IS 'The part of a usage charge that is the extra-session fee; the rest is the script''s price.';
 
-COMMENT ON COLUMN "payments"."credits_ledger"."bonus" IS 'The part of amount that moved bonus credits, with the sign of amount.';
+COMMENT ON COLUMN "payments"."credits_ledger"."bonus" IS 'The part of amount that moved bonus microcredits, with the sign of amount.';
 
 
 CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
@@ -126,7 +132,9 @@ CREATE TABLE IF NOT EXISTS "payments"."earnings_ledger" (
     CONSTRAINT "earnings_ledger_bonus_check" CHECK ("bonus" >= 0)
 );
 
-COMMENT ON COLUMN "payments"."earnings_ledger"."bonus" IS 'The part of a sale''s share that was not paid because the buyer paid with bonus credits.';
+COMMENT ON COLUMN "payments"."earnings_ledger"."amount" IS 'Signed change to earnings, in microcredits.';
+
+COMMENT ON COLUMN "payments"."earnings_ledger"."bonus" IS 'The part of a sale''s share that was not paid because the buyer paid with bonus microcredits.';
 
 
 -- One row per script run, free or premium; no FKs so history survives deletions
@@ -146,14 +154,16 @@ CREATE TABLE IF NOT EXISTS "payments"."sessions" (
     "fee_accrued" bigint DEFAULT 0 NOT NULL,
     "fee_charged" bigint DEFAULT 0 NOT NULL,
     "share_accrued" bigint DEFAULT 0 NOT NULL,
+    "charged_minutes" bigint DEFAULT 0 NOT NULL,
     CONSTRAINT "sessions_price_check" CHECK ("price" >= 0),
     CONSTRAINT "sessions_unpaid_check" CHECK ("unpaid" >= 0),
     CONSTRAINT "sessions_fee_check" CHECK ("fee_accrued" >= 0 AND "fee_charged" >= 0),
     CONSTRAINT "sessions_share_check" CHECK ("share_accrued" >= 0 AND "share_accrued" < 10000),
+    CONSTRAINT "sessions_charged_minutes_check" CHECK ("charged_minutes" >= 0),
     CONSTRAINT "sessions_end_check" CHECK (("ended_at" IS NULL) = ("end_reason" IS NULL))
 );
 
-COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions. price is fixed when the session starts (0 for free scripts and for the author and tester+). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in credit-minutes (a credit is charged per 43200), fee_charged the fee credits charged so far. share_accrued is the author''s share not yet paid, in 1/10000 credits: a whole credit is paid once it adds up.';
+COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions, in microcredits. price is microcredits per hour, fixed when the session starts (0 for free scripts and for the author and tester+); after n charged minutes the script has cost ceil(price x n / 60). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in microcredit-minutes (a microcredit is charged per 43200), fee_charged the fee microcredits charged so far. charged_minutes counts the minutes billed so far. share_accrued is the author''s share not yet paid, in 1/10000 microcredits: a whole microcredit is paid once it adds up.';
 
 -- Keys
 
@@ -222,21 +232,21 @@ BEGIN
     RAISE EXCEPTION 'no payment account for user %', p_user;
   END IF;
 
-  -- Unless told otherwise, spending takes bonus credits in the balance's proportion and gains bring none
+  -- Unless told otherwise, spending takes bonus microcredits in the balance's proportion and gains bring none
   v_bonus := COALESCE(p_bonus, CASE
-    WHEN p_amount < 0 AND v_account.credits > 0 THEN -(LEAST(-p_amount, v_account.credits) * v_account.bonus_credits / v_account.credits)
+    WHEN p_amount < 0 AND v_account.microcredits > 0 THEN -(LEAST(-p_amount, v_account.microcredits) * v_account.bonus_microcredits / v_account.microcredits)
     ELSE 0
   END);
 
   UPDATE payments.accounts
-  SET credits = credits + p_amount, bonus_credits = bonus_credits + v_bonus, updated_at = now()
+  SET microcredits = microcredits + p_amount, bonus_microcredits = bonus_microcredits + v_bonus, updated_at = now()
   WHERE user_id = p_user
   RETURNING * INTO v_account;
 
   INSERT INTO payments.credits_ledger (user_id, kind, amount, balance_after, payment_id, script_id, session_id, minutes, note, granted_by, fee, bonus)
-  VALUES (p_user, p_kind, p_amount, v_account.credits, p_payment, p_script, p_session, p_minutes, p_note, p_actor, p_fee, v_bonus);
+  VALUES (p_user, p_kind, p_amount, v_account.microcredits, p_payment, p_script, p_session, p_minutes, p_note, p_actor, p_fee, v_bonus);
 
-  RETURN v_account.credits;
+  RETURN v_account.microcredits;
 END;
 $$;
 
@@ -292,19 +302,19 @@ BEGIN
 
   UPDATE payments.payments SET status = 'paid', paid_at = now() WHERE id = p_payment;
 
-  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.credits, p_payment, NULL, NULL, NULL, NULL, NULL, v_payment.bonus);
+  PERFORM payments.post_credits(v_payment.user_id, 'topup', v_payment.microcredits, p_payment, NULL, NULL, NULL, NULL, NULL, v_payment.bonus);
 
   RETURN true;
 END;
 $$;
 
 
--- Balance needed to start or keep a session at p_price
+-- Balance needed to start or keep a session at p_price microcredits per hour: min_balance_minutes of it, rounded up
 CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint) RETURNS bigint
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
     AS $$
-  SELECT p_price * min_balance_minutes FROM payments.config;
+  SELECT (min_balance_minutes * p_price + 59) / 60 FROM payments.config;
 $$;
 
 -- A month of running, the unit extra_session_fee is quoted in
@@ -315,12 +325,12 @@ CREATE OR REPLACE FUNCTION "payments"."minutes_per_month"() RETURNS integer
   SELECT 30 * 24 * 60;
 $$;
 
--- The balance a session at p_price with a fee of p_fee credits per month needs: min_balance_minutes of both, the fee rounded up
+-- The balance a session at p_price microcredits per hour with a fee of p_fee microcredits per month needs: min_balance_minutes of both, each rounded up
 CREATE OR REPLACE FUNCTION "payments"."required_balance"("p_price" bigint, "p_fee" bigint) RETURNS bigint
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
     AS $$
-  SELECT c.min_balance_minutes * p_price + ceil(c.min_balance_minutes * p_fee::numeric / payments.minutes_per_month())::bigint
+  SELECT payments.required_balance(p_price) + ceil(c.min_balance_minutes * p_fee::numeric / payments.minutes_per_month())::bigint
   FROM payments.config c;
 $$;
 
@@ -335,7 +345,7 @@ CREATE OR REPLACE FUNCTION "payments"."session_rank"("p_session" "uuid") RETURNS
   WHERE s.id = p_session AND (o.started_at, o.id) < (s.started_at, s.id);
 $$;
 
--- The fee a session of this rank accrues, in credits per month: nothing for the oldest session or for tester+
+-- The fee a session of this rank accrues, in microcredits per month: nothing for the oldest session or for tester+
 CREATE OR REPLACE FUNCTION "payments"."session_fee"("p_user" "uuid", "p_rank" integer) RETURNS bigint
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -367,7 +377,7 @@ CREATE OR REPLACE FUNCTION "payments"."session_quote"("p_user" "uuid", "p_script
   FROM priced, open;
 $$;
 
--- Average per-minute price of runnable paid scripts, or NULL; definer so it sees all of them
+-- Average hourly price of runnable paid scripts, or NULL; definer so it sees all of them
 CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -383,7 +393,7 @@ CREATE OR REPLACE FUNCTION "payments"."average_price"() RETURNS numeric
     AND m.stage IN ('beta'::scripts.stage, 'stable'::scripts.stage);
 $$;
 
--- Internal: charges p_minutes up to the balance, records any shortfall as unpaid, returns credits charged
+-- Internal: charges p_minutes up to the balance, records any shortfall as unpaid, returns microcredits charged
 CREATE OR REPLACE FUNCTION "payments"."charge_session"("p_session" "uuid", "p_minutes" integer) RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -413,19 +423,20 @@ BEGIN
     RETURN 0;
   END IF;
 
-  -- the fee accrues at the rank the session holds now, and a credit is charged for every month's worth of credit-minutes
+  -- the fee accrues at the rank the session holds now, and a microcredit is charged for every month's worth of microcredit-minutes
   v_accrued := v_session.fee_accrued + payments.session_fee(v_session.user_id, payments.session_rank(p_session)) * p_minutes;
   v_fee_due := v_accrued / payments.minutes_per_month();
   UPDATE payments.sessions SET fee_accrued = v_accrued % payments.minutes_per_month() WHERE id = p_session;
 
-  v_cost := v_session.price * p_minutes;
+  v_cost := ((v_session.charged_minutes + p_minutes) * v_session.price + 59) / 60 - (v_session.charged_minutes * v_session.price + 59) / 60;
+  UPDATE payments.sessions SET charged_minutes = charged_minutes + p_minutes WHERE id = p_session;
   v_total := v_cost + v_fee_due;
 
   IF v_total = 0 THEN
     RETURN 0;
   END IF;
 
-  -- lock the account so concurrent sessions can't both spend the same credits
+  -- lock the account so concurrent sessions can't both spend the same microcredits
   SELECT * INTO v_account FROM payments.accounts WHERE user_id = v_session.user_id FOR UPDATE;
 
   -- a deleted user can't pay: the whole cost is unpaid
@@ -434,7 +445,7 @@ BEGIN
     RETURN 0;
   END IF;
 
-  v_charged := LEAST(v_total, v_account.credits);
+  v_charged := LEAST(v_total, v_account.microcredits);
 
   IF v_charged < v_total THEN
     UPDATE payments.sessions SET unpaid = unpaid + (v_total - v_charged) WHERE id = p_session;
@@ -444,9 +455,9 @@ BEGIN
     RETURN 0;
   END IF;
 
-  -- the script is paid first, the fee with what is left; bonus credits pay their share of the balance
+  -- the script is paid first, the fee with what is left; bonus microcredits pay their share of the balance
   v_fee_paid := GREATEST(v_charged - v_cost, 0);
-  v_bonus := v_charged * v_account.bonus_credits / v_account.credits;
+  v_bonus := v_charged * v_account.bonus_microcredits / v_account.microcredits;
 
   PERFORM payments.post_credits(v_session.user_id, 'usage', -v_charged, NULL, v_session.script_id, p_minutes, NULL, p_session, NULL, -v_bonus, v_fee_paid);
 
@@ -454,7 +465,7 @@ BEGIN
     UPDATE payments.sessions SET fee_charged = fee_charged + v_fee_paid WHERE id = p_session;
   END IF;
 
-  -- the author's share is of the script's part only, with fractions of a credit carried; the part paid with bonus credits is lost
+  -- the author's share is of the script's part only, with fractions of a microcredit carried; the part paid with bonus microcredits is lost
   v_share_accrued := v_session.share_accrued + (v_charged - v_fee_paid) * (10000 - (SELECT platform_fee_bps FROM payments.config));
   v_share := v_share_accrued / 10000;
   UPDATE payments.sessions SET share_accrued = v_share_accrued % 10000 WHERE id = p_session;
@@ -517,7 +528,7 @@ BEGIN
   v_fee := payments.session_fee(p_user, v_rank);
   v_required := payments.required_balance(v_price, v_fee);
 
-  IF v_required > 0 AND COALESCE((SELECT a.credits FROM payments.accounts a WHERE a.user_id = p_user), 0) < v_required THEN
+  IF v_required > 0 AND COALESCE((SELECT a.microcredits FROM payments.accounts a WHERE a.user_id = p_user), 0) < v_required THEN
     RAISE EXCEPTION 'insufficient credits' USING ERRCODE = 'check_violation';
   END IF;
 
@@ -603,7 +614,7 @@ BEGIN
   v_required := payments.required_balance(v_session.price, payments.session_fee(v_session.user_id, payments.session_rank(p_session)));
 
   IF v_required > 0 THEN
-    SELECT credits INTO v_balance FROM payments.accounts WHERE user_id = v_session.user_id;
+    SELECT microcredits INTO v_balance FROM payments.accounts WHERE user_id = v_session.user_id;
 
     IF COALESCE(v_balance, 0) < v_required THEN
       PERFORM payments.end_session(p_session, 'insufficient_credits');
