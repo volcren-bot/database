@@ -138,6 +138,16 @@ CREATE TYPE "payments"."session_end" AS ENUM (
 ALTER TYPE "payments"."session_end" OWNER TO "supabase_admin";
 
 
+CREATE TYPE "profiles"."application_status" AS ENUM (
+    'pending',
+    'approved',
+    'rejected'
+);
+
+
+ALTER TYPE "profiles"."application_status" OWNER TO "supabase_admin";
+
+
 CREATE TYPE "profiles"."roles" AS ENUM (
     'user',
     'contributor',
@@ -1252,6 +1262,45 @@ $$;
 ALTER FUNCTION "payments"."transfer_earnings"("p_amount" bigint) OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "profiles"."apply_for_scripter"("p_message" "text") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_id bigint;
+BEGIN
+  IF v_user IS NULL OR NOT EXISTS (
+    SELECT 1 FROM profiles.profiles p
+    WHERE p.id = v_user AND p.role = 'contributor'::profiles.roles AND p.banned_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'only contributors can apply' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NOT profiles.is_scripter_eligible(v_user) THEN
+    RAISE EXCEPTION 'not enough scripts with users yet' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM profiles.scripter_applications a
+    WHERE a.user_id = v_user AND a.status = 'rejected'::profiles.application_status
+      AND a.decided_at > now() - make_interval(days => (SELECT c.scripter_reapply_days FROM scripts.config c))
+  ) THEN
+    RAISE EXCEPTION 'rejected too recently' USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+
+  INSERT INTO profiles.scripter_applications (user_id, message) VALUES (v_user, btrim(p_message))
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."apply_for_scripter"("p_message" "text") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "profiles"."clean_avatar"("url" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO ''
@@ -1281,6 +1330,55 @@ $$;
 
 
 ALTER FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "profiles"."decide_scripter_application"("p_admin" "uuid", "p_application" bigint, "p_approve" boolean, "p_reason" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_user uuid;
+  v_reason text := NULLIF(btrim(p_reason), '');
+BEGIN
+  IF p_admin IS NULL OR NOT profiles.is_role(p_admin, 'administrator') THEN
+    RAISE EXCEPTION 'only administrators decide applications' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_approve IS NULL THEN
+    RAISE EXCEPTION 'p_approve must not be null';
+  END IF;
+
+  IF NOT p_approve AND v_reason IS NULL THEN
+    RAISE EXCEPTION 'a reason is required to reject';
+  END IF;
+
+  SELECT a.user_id INTO v_user FROM profiles.scripter_applications a
+  WHERE a.id = p_application AND a.status = 'pending'::profiles.application_status
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no pending application %', p_application USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF p_approve THEN
+    UPDATE profiles.profiles SET role = 'scripter'::profiles.roles
+    WHERE id = v_user AND role = 'contributor'::profiles.roles AND banned_at IS NULL;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'the applicant is no longer an unbanned contributor' USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+  END IF;
+
+  UPDATE profiles.scripter_applications
+  SET status = CASE WHEN p_approve THEN 'approved'::profiles.application_status ELSE 'rejected'::profiles.application_status END,
+      decided_at = now(), decided_by = p_admin, reason = v_reason
+  WHERE id = p_application;
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."decide_scripter_application"("p_admin" "uuid", "p_application" bigint, "p_approve" boolean, "p_reason" "text") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "profiles"."get_provider_id"("user_id" "uuid", "provider" "text") RETURNS "text"
@@ -1426,6 +1524,23 @@ $$;
 ALTER FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "profiles"."roles") OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "profiles"."is_scripter_eligible"("p_user" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  RETURN (
+    SELECT count(*) FROM profiles.scripter_progress(p_user) g
+    WHERE g.users >= (SELECT c.scripter_min_users FROM scripts.config c)
+  ) >= (SELECT c.scripter_min_scripts FROM scripts.config c);
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."is_scripter_eligible"("p_user" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -1503,6 +1618,35 @@ $$;
 
 
 ALTER FUNCTION "profiles"."require_discord"() OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "profiles"."scripter_progress"("p_user" "uuid") RETURNS TABLE("script_id" "uuid", "users" integer)
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF auth.role() <> 'service_role' AND p_user IS DISTINCT FROM auth.uid() THEN
+    RAISE EXCEPTION 'only your own progress' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  RETURN QUERY
+  SELECT p.id, (
+    SELECT count(DISTINCT s.user_id)::integer
+    FROM payments.sessions s
+    JOIN profiles.profiles u ON u.id = s.user_id
+    WHERE s.script_id = p.id
+      AND s.user_id <> p_user
+      AND u.banned_at IS NULL
+      AND s.charged_minutes >= (SELECT c.scripter_min_minutes FROM scripts.config c)
+  )
+  FROM scripts.protected p
+  WHERE p.author = p_user;
+END;
+$$;
+
+
+ALTER FUNCTION "profiles"."scripter_progress"("p_user" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "profiles"."scrub_identity_email"() RETURNS "trigger"
@@ -3064,6 +3208,39 @@ COMMENT ON COLUMN "profiles"."profiles"."banned_at" IS 'Set while the account is
 
 
 
+CREATE TABLE IF NOT EXISTS "profiles"."scripter_applications" (
+    "id" bigint NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "message" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "decided_at" timestamp with time zone,
+    "decided_by" "uuid",
+    "reason" "text",
+    "status" "profiles"."application_status" DEFAULT 'pending'::"profiles"."application_status" NOT NULL,
+    CONSTRAINT "scripter_applications_decided_check" CHECK (((("status" = 'pending'::"profiles"."application_status") = ("decided_at" IS NULL)) AND (("decided_at" IS NULL) = ("decided_by" IS NULL)) AND (("status" <> 'rejected'::"profiles"."application_status") OR ("reason" IS NOT NULL)))),
+    CONSTRAINT "scripter_applications_message_check" CHECK ((("message" = "btrim"("message")) AND (("char_length"("message") >= 1) AND ("char_length"("message") <= 2000)))),
+    CONSTRAINT "scripter_applications_reason_check" CHECK ((("reason" IS NULL) OR (("reason" = "btrim"("reason")) AND (("char_length"("reason") >= 1) AND ("char_length"("reason") <= 500)))))
+);
+
+
+ALTER TABLE "profiles"."scripter_applications" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "profiles"."scripter_applications" IS 'Written only by profiles.apply_for_scripter and profiles.decide_scripter_application. decided_by has no FK so the record outlives the admin.';
+
+
+
+ALTER TABLE "profiles"."scripter_applications" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "profiles"."scripter_applications_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."bundles" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "author" "uuid" DEFAULT "auth"."uid"() NOT NULL,
@@ -3083,7 +3260,12 @@ CREATE TABLE IF NOT EXISTS "scripts"."config" (
     "max_share_code_days" integer DEFAULT 30 NOT NULL,
     "redeem_max_failures" integer DEFAULT 10 NOT NULL,
     "redeem_window_minutes" integer DEFAULT 60 NOT NULL,
+    "scripter_min_scripts" integer DEFAULT 3 NOT NULL,
+    "scripter_min_users" integer DEFAULT 5 NOT NULL,
+    "scripter_min_minutes" integer DEFAULT 10 NOT NULL,
+    "scripter_reapply_days" integer DEFAULT 30 NOT NULL,
     CONSTRAINT "config_check" CHECK ((("max_community_scripts" > 0) AND ("max_community_bytes" > 0) AND ("max_open_share_codes" > 0) AND ("max_share_code_days" > 0) AND ("redeem_max_failures" > 0) AND ("redeem_window_minutes" > 0))),
+    CONSTRAINT "config_scripter_check" CHECK ((("scripter_min_scripts" > 0) AND ("scripter_min_users" > 0) AND ("scripter_min_minutes" > 0) AND ("scripter_reapply_days" >= 0))),
     CONSTRAINT "config_singleton" CHECK ("id")
 );
 
@@ -3108,6 +3290,22 @@ COMMENT ON COLUMN "scripts"."config"."max_share_code_days" IS 'The furthest a sh
 
 
 COMMENT ON COLUMN "scripts"."config"."redeem_max_failures" IS 'Failed share code redemptions an account gets per redeem_window_minutes before redeem_share_code stops answering.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_scripts" IS 'Scripts with scripter_min_users users a contributor needs to apply for scripter (profiles.apply_for_scripter).';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_users" IS 'Distinct other, unbanned users a script needs to count towards scripter_min_scripts.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_minutes" IS 'Billed minutes one session needs for its user to count towards scripter_min_users.';
+
+
+
+COMMENT ON COLUMN "scripts"."config"."scripter_reapply_days" IS 'Days after a rejected scripter application before the contributor can apply again.';
 
 
 
@@ -3417,6 +3615,11 @@ ALTER TABLE ONLY "profiles"."profiles"
 
 
 
+ALTER TABLE ONLY "profiles"."scripter_applications"
+    ADD CONSTRAINT "scripter_applications_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "scripts"."bundles"
     ADD CONSTRAINT "bundles_pkey" PRIMARY KEY ("id");
 
@@ -3562,7 +3765,19 @@ CREATE INDEX "sessions_open_last_seen_idx" ON "payments"."sessions" USING "btree
 
 
 
+CREATE INDEX "sessions_script_id_idx" ON "payments"."sessions" USING "btree" ("script_id", "user_id");
+
+
+
 CREATE INDEX "sessions_user_id_idx" ON "payments"."sessions" USING "btree" ("user_id", "started_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "scripter_applications_one_pending_idx" ON "profiles"."scripter_applications" USING "btree" ("user_id") WHERE ("status" = 'pending'::"profiles"."application_status");
+
+
+
+CREATE INDEX "scripter_applications_user_id_idx" ON "profiles"."scripter_applications" USING "btree" ("user_id", "created_at" DESC);
 
 
 
@@ -3751,6 +3966,11 @@ ALTER TABLE ONLY "payments"."credits_ledger"
 
 ALTER TABLE ONLY "profiles"."profiles"
     ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "profiles"."scripter_applications"
+    ADD CONSTRAINT "scripter_applications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "profiles"."profiles"("id") ON DELETE CASCADE;
 
 
 
@@ -3947,6 +4167,10 @@ ALTER TABLE "payments"."payments" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."sessions" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "SELECT for OWNER" ON "profiles"."scripter_applications" FOR SELECT TO "authenticated" USING (("user_id" = ( SELECT "auth"."uid"() AS "uid")));
+
+
+
 CREATE POLICY "SELECT for OWNER and MODERATOR" ON "profiles"."profiles" FOR SELECT TO "authenticated" USING ((("id" = ( SELECT "auth"."uid"() AS "uid")) OR "profiles"."min_role"(( SELECT "auth"."uid"() AS "uid"), 'moderator'::"profiles"."roles")));
 
 
@@ -3962,6 +4186,9 @@ ALTER TABLE "profiles"."impersonations" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "profiles"."profiles" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "profiles"."scripter_applications" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "DELETE for AUTHOR" ON "scripts"."deploy_tokens" FOR DELETE TO "authenticated" USING (("profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
@@ -4188,6 +4415,10 @@ GRANT ALL ON TYPE "feedback"."report_status" TO "postgres";
 
 
 GRANT ALL ON TYPE "payments"."session_end" TO "postgres";
+
+
+
+GRANT ALL ON TYPE "profiles"."application_status" TO "postgres";
 
 
 
@@ -4426,6 +4657,12 @@ GRANT ALL ON FUNCTION "payments"."transfer_earnings"("p_amount" bigint) TO "serv
 
 
 
+REVOKE ALL ON FUNCTION "profiles"."apply_for_scripter"("p_message" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."apply_for_scripter"("p_message" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "profiles"."apply_for_scripter"("p_message" "text") TO "postgres";
+
+
+
 REVOKE ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "postgres";
 GRANT ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
@@ -4435,6 +4672,12 @@ GRANT ALL ON FUNCTION "profiles"."clean_avatar"("url" "text") TO "service_role";
 REVOKE ALL ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") TO "postgres";
 GRANT ALL ON FUNCTION "profiles"."clean_username"("name" "text", "id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "profiles"."decide_scripter_application"("p_admin" "uuid", "p_application" bigint, "p_approve" boolean, "p_reason" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."decide_scripter_application"("p_admin" "uuid", "p_application" bigint, "p_approve" boolean, "p_reason" "text") TO "postgres";
+GRANT ALL ON FUNCTION "profiles"."decide_scripter_application"("p_admin" "uuid", "p_application" bigint, "p_approve" boolean, "p_reason" "text") TO "service_role";
 
 
 
@@ -4483,6 +4726,12 @@ GRANT ALL ON FUNCTION "profiles"."is_role"("user_id" "uuid", "target_role" "prof
 
 
 
+REVOKE ALL ON FUNCTION "profiles"."is_scripter_eligible"("p_user" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."is_scripter_eligible"("p_user" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "profiles"."is_scripter_eligible"("p_user" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."log_impersonation"("p_admin" "uuid", "p_user" "uuid") TO "service_role";
 
@@ -4500,6 +4749,13 @@ REVOKE ALL ON FUNCTION "profiles"."refresh_avatar"() FROM PUBLIC;
 
 REVOKE ALL ON FUNCTION "profiles"."require_discord"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "profiles"."require_discord"() TO "postgres";
+
+
+
+REVOKE ALL ON FUNCTION "profiles"."scripter_progress"("p_user" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "profiles"."scripter_progress"("p_user" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "profiles"."scripter_progress"("p_user" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "profiles"."scripter_progress"("p_user" "uuid") TO "service_role";
 
 
 
@@ -4896,6 +5152,12 @@ GRANT ALL ON TABLE "profiles"."profiles" TO "service_role";
 
 
 GRANT UPDATE("username") ON TABLE "profiles"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT ON TABLE "profiles"."scripter_applications" TO "authenticated";
+GRANT ALL ON TABLE "profiles"."scripter_applications" TO "postgres";
+GRANT SELECT ON TABLE "profiles"."scripter_applications" TO "service_role";
 
 
 
