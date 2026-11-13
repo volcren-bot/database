@@ -172,6 +172,8 @@ ALTER TABLE ONLY "payments"."sessions"
 
 CREATE INDEX "sessions_user_id_idx" ON "payments"."sessions" USING "btree" ("user_id", "started_at" DESC);
 
+CREATE INDEX "sessions_script_id_idx" ON "payments"."sessions" USING "btree" ("script_id", "user_id");
+
 CREATE INDEX "sessions_open_last_seen_idx" ON "payments"."sessions" USING "btree" ("last_seen") WHERE ("ended_at" IS NULL);
 
 ALTER TABLE ONLY "payments"."config"

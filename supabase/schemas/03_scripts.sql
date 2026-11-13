@@ -174,7 +174,14 @@ CREATE TABLE IF NOT EXISTS "scripts"."config" (
     "max_share_code_days" integer DEFAULT 30 NOT NULL,
     "redeem_max_failures" integer DEFAULT 10 NOT NULL,
     "redeem_window_minutes" integer DEFAULT 60 NOT NULL,
+    "scripter_min_scripts" integer DEFAULT 3 NOT NULL,
+    "scripter_min_users" integer DEFAULT 5 NOT NULL,
+    "scripter_min_minutes" integer DEFAULT 10 NOT NULL,
+    "scripter_reapply_days" integer DEFAULT 30 NOT NULL,
     CONSTRAINT "config_singleton" CHECK ("id"),
+    CONSTRAINT "config_scripter_check" CHECK (
+        "scripter_min_scripts" > 0 AND "scripter_min_users" > 0 AND "scripter_min_minutes" > 0 AND "scripter_reapply_days" >= 0
+    ),
     CONSTRAINT "config_check" CHECK (
         "max_community_scripts" > 0 AND "max_community_bytes" > 0 AND "max_open_share_codes" > 0
         AND "max_share_code_days" > 0 AND "redeem_max_failures" > 0 AND "redeem_window_minutes" > 0
@@ -190,6 +197,14 @@ COMMENT ON COLUMN "scripts"."config"."max_open_share_codes" IS 'Unredeemed, unex
 COMMENT ON COLUMN "scripts"."config"."max_share_code_days" IS 'The furthest a share code expiry can be set.';
 
 COMMENT ON COLUMN "scripts"."config"."redeem_max_failures" IS 'Failed share code redemptions an account gets per redeem_window_minutes before redeem_share_code stops answering.';
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_scripts" IS 'Scripts with scripter_min_users users a contributor needs to apply for scripter (profiles.apply_for_scripter).';
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_users" IS 'Distinct other, unbanned users a script needs to count towards scripter_min_scripts.';
+
+COMMENT ON COLUMN "scripts"."config"."scripter_min_minutes" IS 'Billed minutes one session needs for its user to count towards scripter_min_users.';
+
+COMMENT ON COLUMN "scripts"."config"."scripter_reapply_days" IS 'Days after a rejected scripter application before the contributor can apply again.';
 
 -- Hashes only; single-use, redeem_share_code marks it used and grants in one step
 CREATE TABLE IF NOT EXISTS "scripts"."share_codes" (
