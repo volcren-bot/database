@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS "scripts"."protected" (
     "revision" integer DEFAULT 0 NOT NULL,
     "last_revision" integer DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "queueable" boolean DEFAULT false NOT NULL
 );
 
 COMMENT ON COLUMN "scripts"."protected"."revision" IS 'The live revision. 0 means none yet, and the script can''t be run.';
@@ -129,6 +130,90 @@ CREATE OR REPLACE FUNCTION "scripts"."valid_files"("files" "text"[]) RETURNS boo
 $$;
 
 
+CREATE OR REPLACE FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") RETURNS boolean
+    LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  v_goals jsonb := COALESCE(manifest -> 'goals', '[]'::jsonb);
+  v_settings jsonb := manifest -> 'settings';
+  v_goal jsonb;
+  v_field jsonb;
+BEGIN
+  IF manifest IS NULL THEN
+    RETURN true;
+  END IF;
+
+  IF jsonb_typeof(manifest) <> 'object' OR octet_length(manifest::text) > 65536 THEN
+    RETURN false;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM jsonb_object_keys(manifest) k WHERE k NOT IN ('queueable', 'goals', 'settings', 'finish_grace_minutes')) THEN
+    RETURN false;
+  END IF;
+
+  IF manifest ? 'queueable' AND jsonb_typeof(manifest -> 'queueable') <> 'boolean' THEN
+    RETURN false;
+  END IF;
+
+  IF manifest ? 'finish_grace_minutes' THEN
+    IF jsonb_typeof(manifest -> 'finish_grace_minutes') <> 'number' THEN
+      RETURN false;
+    END IF;
+
+    IF (manifest ->> 'finish_grace_minutes')::numeric NOT BETWEEN 1 AND 120
+       OR (manifest ->> 'finish_grace_minutes')::numeric % 1 <> 0 THEN
+      RETURN false;
+    END IF;
+  END IF;
+
+  IF jsonb_typeof(v_goals) <> 'array' THEN
+    RETURN false;
+  END IF;
+
+  IF jsonb_array_length(v_goals) > 16 THEN
+    RETURN false;
+  END IF;
+
+  FOR v_goal IN SELECT * FROM jsonb_array_elements(v_goals) LOOP
+    IF jsonb_typeof(v_goal) <> 'object' THEN
+      RETURN false;
+    END IF;
+
+    IF (SELECT count(*) FROM jsonb_object_keys(v_goal)) <> 2
+       OR jsonb_typeof(v_goal -> 'id') IS DISTINCT FROM 'string'
+       OR jsonb_typeof(v_goal -> 'label') IS DISTINCT FROM 'string'
+       OR v_goal ->> 'id' !~ '^[a-z][a-z0-9_]{0,31}$'
+       OR char_length(v_goal ->> 'label') NOT BETWEEN 1 AND 64 THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  IF (SELECT count(DISTINCT g ->> 'id') FROM jsonb_array_elements(v_goals) g) <> jsonb_array_length(v_goals) THEN
+    RETURN false;
+  END IF;
+
+  IF v_settings IS NOT NULL THEN
+    IF jsonb_typeof(v_settings) <> 'object' OR jsonb_typeof(v_settings -> 'fields') IS DISTINCT FROM 'array' THEN
+      RETURN false;
+    END IF;
+
+    IF jsonb_array_length(v_settings -> 'fields') > 200 THEN
+      RETURN false;
+    END IF;
+
+    FOR v_field IN SELECT * FROM jsonb_array_elements(v_settings -> 'fields') LOOP
+      IF jsonb_typeof(v_field) <> 'object' THEN
+        RETURN false;
+      END IF;
+    END LOOP;
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "id" "uuid" NOT NULL,
     "revision" integer NOT NULL,
@@ -138,7 +223,9 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "status" "scripts"."version_status" DEFAULT 'pending'::"scripts"."version_status" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "published_at" timestamp with time zone,
+    "manifest" "jsonb",
     CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
+    CONSTRAINT "versions_manifest_check" CHECK ("scripts"."valid_manifest"("manifest")),
     CONSTRAINT "versions_entry_check" CHECK ("entry" = ANY("files")),
     CONSTRAINT "versions_sizes_check" CHECK ((cardinality("sizes") = 0 OR cardinality("sizes") = cardinality("files")) AND 0 <= ALL("sizes"))
 );
@@ -898,9 +985,22 @@ BEGIN
   UPDATE scripts.versions v SET status = 'live', published_at = now()
   WHERE v.id = script_id AND v.revision = publish_version.revision;
 
-  UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now()
+  UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now(),
+    queueable = COALESCE((v_version.manifest ->> 'queueable')::boolean, false)
   WHERE p.id = script_id;
 END;
+$$;
+
+CREATE OR REPLACE FUNCTION "scripts"."live_manifest"("script_id" "uuid") RETURNS TABLE("revision" integer, "manifest" "jsonb")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT v.revision, v.manifest
+  FROM scripts.protected p
+  JOIN scripts.versions v ON v.id = p.id AND v.revision = p.revision
+  WHERE p.id = live_manifest.script_id
+    AND (auth.role() = 'service_role' OR scripts.can_view(profiles.uid(), live_manifest.script_id));
 $$;
 
 -- Stores a pending revision's AES-256 key (64 hex digits) once; same callers as publish_version
@@ -1267,7 +1367,7 @@ GRANT SELECT ON TABLE "scripts"."scripts", "scripts"."metadata", "scripts"."prot
 GRANT INSERT ("title", "description", "content") ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT UPDATE ("title", "description", "content", "published") ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT UPDATE ("type", "categories", "stage", "price") ON TABLE "scripts"."metadata" TO "authenticated";
-GRANT INSERT ("id", "files", "sizes", "entry") ON TABLE "scripts"."versions" TO "authenticated";
+GRANT INSERT ("id", "files", "sizes", "entry", "manifest") ON TABLE "scripts"."versions" TO "authenticated";
 GRANT DELETE ON TABLE "scripts"."scripts" TO "authenticated";
 GRANT INSERT ("name", "scripts") ON TABLE "scripts"."bundles" TO "authenticated";
 GRANT UPDATE ("name", "scripts") ON TABLE "scripts"."bundles" TO "authenticated";
@@ -1317,6 +1417,10 @@ GRANT EXECUTE ON FUNCTION "scripts"."safe_uuid"("value" "text") TO "anon", "auth
 -- Called by versions_files_check, so whoever inserts a revision needs it
 REVOKE ALL ON FUNCTION "scripts"."valid_files"("files" "text"[]) FROM PUBLIC, "anon";
 GRANT EXECUTE ON FUNCTION "scripts"."valid_files"("files" "text"[]) TO "authenticated", "service_role";
+REVOKE ALL ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") TO "authenticated", "service_role";
+REVOKE ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") FROM PUBLIC, "anon";
+GRANT EXECUTE ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_author"("user_id" "uuid", "script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_premium"("script_id" "uuid") TO "anon", "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "scripts"."is_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon", "authenticated", "service_role";
