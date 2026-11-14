@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS "payments"."config" (
     "session_timeout_minutes" integer DEFAULT 5 NOT NULL,
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
     "extra_session_fee" bigint DEFAULT 3000000 NOT NULL,
+    "max_agent_sessions" integer DEFAULT 8 NOT NULL,
     CONSTRAINT "config_singleton" CHECK ("id"),
+    CONSTRAINT "config_max_agent_sessions_check" CHECK ("max_agent_sessions" > 0),
     CONSTRAINT "config_extra_session_fee_check" CHECK ("extra_session_fee" >= 0),
     CONSTRAINT "config_fee_check" CHECK ("platform_fee_bps" BETWEEN 0 AND 10000),
     CONSTRAINT "config_check" CHECK ("session_timeout_minutes" > 0 AND "min_balance_minutes" > 0)
@@ -42,6 +44,8 @@ COMMENT ON COLUMN "payments"."config"."platform_fee_bps" IS 'Platform cut of eac
 COMMENT ON COLUMN "payments"."config"."session_timeout_minutes" IS 'A session without a heartbeat for this long is ended with reason timeout.';
 
 COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs a balance covering this many minutes at its hourly price to start and to keep running (see payments.required_balance).';
+
+COMMENT ON COLUMN "payments"."config"."max_agent_sessions" IS 'Open agent sessions an account may have at once.';
 
 COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Microcredits every extra concurrent session of an account costs per 30 days of running (3000000 = 3 EUR). The oldest open session is free, and tester+ pay no fee.';
 
@@ -165,7 +169,28 @@ CREATE TABLE IF NOT EXISTS "payments"."sessions" (
 
 COMMENT ON TABLE "payments"."sessions" IS 'Usage sessions, in microcredits. price is microcredits per hour, fixed when the session starts (0 for free scripts and for the author and tester+); after n charged minutes the script has cost ceil(price x n / 60). unpaid is the part of a charge the balance could not cover. fee_accrued is the extra-session fee owed in microcredit-minutes (a microcredit is charged per 43200), fee_charged the fee microcredits charged so far. charged_minutes counts the minutes billed so far. share_accrued is the author''s share not yet paid, in 1/10000 microcredits: a whole microcredit is paid once it adds up.';
 
+CREATE TABLE IF NOT EXISTS "payments"."agent_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_seen" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "ended_at" timestamp with time zone,
+    "end_reason" "payments"."session_end",
+    "active_seconds" integer DEFAULT 0 NOT NULL,
+    CONSTRAINT "agent_sessions_active_seconds_check" CHECK ("active_seconds" >= 0),
+    CONSTRAINT "agent_sessions_end_check" CHECK (("ended_at" IS NULL) = ("end_reason" IS NULL))
+);
+
+COMMENT ON TABLE "payments"."agent_sessions" IS 'Free agent runs from the loader''s MCP server, metered but never billed. active_seconds adds the time between heartbeats, each gap capped by the API (2 x its heartbeat interval), so a loader that stalls or crashes is not counted past it. No FKs, like sessions.';
+
 -- Keys
+
+ALTER TABLE ONLY "payments"."agent_sessions"
+    ADD CONSTRAINT "agent_sessions_pkey" PRIMARY KEY ("id");
+
+CREATE INDEX "agent_sessions_user_id_idx" ON "payments"."agent_sessions" USING "btree" ("user_id", "started_at" DESC);
+
+CREATE INDEX "agent_sessions_open_last_seen_idx" ON "payments"."agent_sessions" USING "btree" ("last_seen") WHERE ("ended_at" IS NULL);
 
 ALTER TABLE ONLY "payments"."sessions"
     ADD CONSTRAINT "sessions_pkey" PRIMARY KEY ("id");
@@ -684,6 +709,7 @@ DECLARE
   v_id uuid;
   v_timeout interval := make_interval(mins => (SELECT session_timeout_minutes FROM payments.config));
   v_count integer := 0;
+  v_agents integer;
 BEGIN
   FOR v_id IN
     SELECT id FROM payments.sessions
@@ -705,7 +731,89 @@ BEGIN
     END;
   END LOOP;
 
-  RETURN v_count;
+  UPDATE payments.agent_sessions
+  SET ended_at = now(), end_reason = 'timeout'
+  WHERE ended_at IS NULL AND last_seen < now() - v_timeout;
+  GET DIAGNOSTICS v_agents = ROW_COUNT;
+
+  RETURN v_count + v_agents;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."start_agent_session"("p_user" "uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('payments.agent_sessions.' || p_user::text));
+  IF (SELECT count(*) FROM payments.agent_sessions a WHERE a.user_id = p_user AND a.ended_at IS NULL)
+     >= (SELECT c.max_agent_sessions FROM payments.config c) THEN
+    RAISE EXCEPTION 'too many agent sessions' USING ERRCODE = 'program_limit_exceeded';
+  END IF;
+
+  INSERT INTO payments.agent_sessions AS a (user_id) VALUES (p_user) RETURNING a.id INTO v_id;
+  RETURN v_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.agent_sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.agent_sessions a WHERE a.id = p_session AND a.user_id = p_user FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent session not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  UPDATE payments.agent_sessions
+  SET active_seconds = active_seconds + LEAST(GREATEST(round(extract(epoch FROM now() - last_seen)), 0), GREATEST(p_max_gap, 0))::integer,
+      last_seen = now()
+  WHERE id = p_session;
+
+  RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.agent_sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.agent_sessions a WHERE a.id = p_session AND a.user_id = p_user FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent session not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  UPDATE payments.agent_sessions
+  SET active_seconds = active_seconds + LEAST(GREATEST(round(extract(epoch FROM now() - last_seen)), 0), GREATEST(p_max_gap, 0))::integer,
+      last_seen = now(), ended_at = now(), end_reason = 'stopped'
+  WHERE id = p_session;
+
+  RETURN true;
 END;
 $$;
 
@@ -846,6 +954,7 @@ ALTER TABLE "payments"."payments" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."credits_ledger" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."earnings_ledger" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."sessions" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "payments"."agent_sessions" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "SELECT for OWNER" ON "payments"."accounts" FOR SELECT TO "authenticated" USING ("user_id" = "profiles"."uid"());
 
@@ -862,11 +971,11 @@ CREATE POLICY "SELECT for OWNER" ON "payments"."earnings_ledger" FOR SELECT TO "
 GRANT USAGE ON SCHEMA "payments" TO "authenticated";
 GRANT USAGE ON SCHEMA "payments" TO "service_role";
 
-REVOKE ALL ON TABLE "payments"."config", "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" FROM "anon", "authenticated";
+REVOKE ALL ON TABLE "payments"."config", "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions" FROM "anon", "authenticated";
 
 GRANT SELECT ON TABLE "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" TO "authenticated";
 GRANT ALL ON TABLE "payments"."config", "payments"."payments" TO "service_role";
-GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" TO "service_role";
+GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions" TO "service_role";
 
 REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid", bigint, bigint) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."minutes_per_month"() FROM PUBLIC, "anon", "authenticated";
@@ -890,6 +999,9 @@ REVOKE ALL ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end"
 REVOKE ALL ON FUNCTION "payments"."heartbeat_session"("uuid") FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_stale_sessions"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."end_user_sessions"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."start_agent_session"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."heartbeat_agent_session"("uuid", "uuid", integer) FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."end_agent_session"("uuid", "uuid", integer) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."stop_session"("uuid") FROM PUBLIC, "anon";
 REVOKE ALL ON FUNCTION "payments"."tr_profiles_pre_delete"() FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."transfer_earnings"(bigint) FROM PUBLIC, "anon";
@@ -909,5 +1021,8 @@ GRANT EXECUTE ON FUNCTION "payments"."start_session"("uuid", "uuid") TO "service
 GRANT EXECUTE ON FUNCTION "payments"."end_session"("uuid", "payments"."session_end") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."heartbeat_session"("uuid") TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."end_stale_sessions"() TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."start_agent_session"("uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."heartbeat_agent_session"("uuid", "uuid", integer) TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."end_agent_session"("uuid", "uuid", integer) TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."transfer_earnings"(bigint) TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."stop_session"("uuid") TO "authenticated", "service_role";
