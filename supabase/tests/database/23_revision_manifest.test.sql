@@ -18,10 +18,15 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION pg_temp.pass(p_script uuid, p_revision integer) RETURNS void LANGUAGE sql SECURITY DEFINER AS $$
+  SELECT scripts.record_check(p_script, p_revision, 'test', 0, NULL);
+$$;
+
 CREATE FUNCTION pg_temp.publish(p_script uuid, p_revision integer) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_script::text || '/' || lpad(p_revision::text, 9, '0') || '/main.luau');
   PERFORM scripts.set_version_key(p_script, p_revision, repeat('ab', 32));
+  PERFORM pg_temp.pass(p_script, p_revision);
   PERFORM scripts.publish_version(p_script, p_revision);
 END;
 $$;

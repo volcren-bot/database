@@ -22,6 +22,7 @@ BEGIN
   INSERT INTO scripts.versions (id, files) VALUES (p_id, ARRAY['main.luau']);
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_id || '/000000001/main.luau');
   INSERT INTO scripts.version_keys (id, revision, key) VALUES (p_id, 1, decode(repeat('ab', 32), 'hex'));
+  PERFORM scripts.record_check(p_id, 1, 'test', 0, NULL);
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', p_author, 'role', 'authenticated')::text, true);
   SET LOCAL ROLE authenticated;
   PERFORM scripts.publish_version(p_id, 1);
