@@ -736,6 +736,37 @@ $$;
 ALTER FUNCTION "payments"."charge_session"("p_session" "uuid", "p_minutes" integer) OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.agent_sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.agent_sessions a WHERE a.id = p_session AND a.user_id = p_user FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent session not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  UPDATE payments.agent_sessions
+  SET active_seconds = active_seconds + LEAST(GREATEST(round(extract(epoch FROM now() - last_seen)), 0), GREATEST(p_max_gap, 0))::integer,
+      last_seen = now(), ended_at = now(), end_reason = 'stopped'
+  WHERE id = p_session;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "payments"."end_session"("p_session" "uuid", "p_reason" "payments"."session_end") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
@@ -785,6 +816,7 @@ DECLARE
   v_id uuid;
   v_timeout interval := make_interval(mins => (SELECT session_timeout_minutes FROM payments.config));
   v_count integer := 0;
+  v_agents integer;
 BEGIN
   FOR v_id IN
     SELECT id FROM payments.sessions
@@ -806,7 +838,12 @@ BEGIN
     END;
   END LOOP;
 
-  RETURN v_count;
+  UPDATE payments.agent_sessions
+  SET ended_at = now(), end_reason = 'timeout'
+  WHERE ended_at IS NULL AND last_seen < now() - v_timeout;
+  GET DIAGNOSTICS v_agents = ROW_COUNT;
+
+  RETURN v_count + v_agents;
 END;
 $$;
 
@@ -836,6 +873,37 @@ $$;
 
 
 ALTER FUNCTION "payments"."end_user_sessions"("p_user" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_session payments.agent_sessions;
+BEGIN
+  SELECT * INTO v_session FROM payments.agent_sessions a WHERE a.id = p_session AND a.user_id = p_user FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent session not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_session.ended_at IS NOT NULL THEN
+    RETURN false;
+  END IF;
+
+  UPDATE payments.agent_sessions
+  SET active_seconds = active_seconds + LEAST(GREATEST(round(extract(epoch FROM now() - last_seen)), 0), GREATEST(p_max_gap, 0))::integer,
+      last_seen = now()
+  WHERE id = p_session;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."heartbeat_session"("p_session" "uuid") RETURNS boolean
@@ -1069,6 +1137,33 @@ $$;
 
 
 ALTER FUNCTION "payments"."settle_payment"("p_payment" "uuid") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "payments"."start_agent_session"("p_user" "uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF profiles.is_banned(p_user) THEN
+    RAISE EXCEPTION 'account banned' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('payments.agent_sessions.' || p_user::text));
+  IF (SELECT count(*) FROM payments.agent_sessions a WHERE a.user_id = p_user AND a.ended_at IS NULL)
+     >= (SELECT c.max_agent_sessions FROM payments.config c) THEN
+    RAISE EXCEPTION 'too many agent sessions' USING ERRCODE = 'program_limit_exceeded';
+  END IF;
+
+  INSERT INTO payments.agent_sessions AS a (user_id) VALUES (p_user) RETURNING a.id INTO v_id;
+  RETURN v_id;
+END;
+$$;
+
+
+ALTER FUNCTION "payments"."start_agent_session"("p_user" "uuid") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint)
@@ -2289,6 +2384,22 @@ $$;
 ALTER FUNCTION "scripts"."list_grantees"("p_script" "uuid") OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."live_manifest"("script_id" "uuid") RETURNS TABLE("revision" integer, "manifest" "jsonb")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT v.revision, v.manifest
+  FROM scripts.protected p
+  JOIN scripts.versions v ON v.id = p.id AND v.revision = p.revision
+  WHERE p.id = live_manifest.script_id
+    AND (auth.role() = 'service_role' OR scripts.can_view(profiles.uid(), live_manifest.script_id));
+$$;
+
+
+ALTER FUNCTION "scripts"."live_manifest"("script_id" "uuid") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -2368,7 +2479,8 @@ BEGIN
   UPDATE scripts.versions v SET status = 'live', published_at = now()
   WHERE v.id = script_id AND v.revision = publish_version.revision;
 
-  UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now()
+  UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now(),
+    queueable = COALESCE((v_version.manifest ->> 'queueable')::boolean, false)
   WHERE p.id = script_id;
 END;
 $$;
@@ -2748,6 +2860,93 @@ $_$;
 ALTER FUNCTION "scripts"."valid_files"("files" "text"[]) OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") RETURNS boolean
+    LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO ''
+    AS $_$
+DECLARE
+  v_goals jsonb := COALESCE(manifest -> 'goals', '[]'::jsonb);
+  v_settings jsonb := manifest -> 'settings';
+  v_goal jsonb;
+  v_field jsonb;
+BEGIN
+  IF manifest IS NULL THEN
+    RETURN true;
+  END IF;
+
+  IF jsonb_typeof(manifest) <> 'object' OR octet_length(manifest::text) > 65536 THEN
+    RETURN false;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM jsonb_object_keys(manifest) k WHERE k NOT IN ('queueable', 'goals', 'settings', 'finish_grace_minutes')) THEN
+    RETURN false;
+  END IF;
+
+  IF manifest ? 'queueable' AND jsonb_typeof(manifest -> 'queueable') <> 'boolean' THEN
+    RETURN false;
+  END IF;
+
+  IF manifest ? 'finish_grace_minutes' THEN
+    IF jsonb_typeof(manifest -> 'finish_grace_minutes') <> 'number' THEN
+      RETURN false;
+    END IF;
+
+    IF (manifest ->> 'finish_grace_minutes')::numeric NOT BETWEEN 1 AND 120
+       OR (manifest ->> 'finish_grace_minutes')::numeric % 1 <> 0 THEN
+      RETURN false;
+    END IF;
+  END IF;
+
+  IF jsonb_typeof(v_goals) <> 'array' THEN
+    RETURN false;
+  END IF;
+
+  IF jsonb_array_length(v_goals) > 16 THEN
+    RETURN false;
+  END IF;
+
+  FOR v_goal IN SELECT * FROM jsonb_array_elements(v_goals) LOOP
+    IF jsonb_typeof(v_goal) <> 'object' THEN
+      RETURN false;
+    END IF;
+
+    IF (SELECT count(*) FROM jsonb_object_keys(v_goal)) <> 2
+       OR jsonb_typeof(v_goal -> 'id') IS DISTINCT FROM 'string'
+       OR jsonb_typeof(v_goal -> 'label') IS DISTINCT FROM 'string'
+       OR v_goal ->> 'id' !~ '^[a-z][a-z0-9_]{0,31}$'
+       OR char_length(v_goal ->> 'label') NOT BETWEEN 1 AND 64 THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  IF (SELECT count(DISTINCT g ->> 'id') FROM jsonb_array_elements(v_goals) g) <> jsonb_array_length(v_goals) THEN
+    RETURN false;
+  END IF;
+
+  IF v_settings IS NOT NULL THEN
+    IF jsonb_typeof(v_settings) <> 'object' OR jsonb_typeof(v_settings -> 'fields') IS DISTINCT FROM 'array' THEN
+      RETURN false;
+    END IF;
+
+    IF jsonb_array_length(v_settings -> 'fields') > 200 THEN
+      RETURN false;
+    END IF;
+
+    FOR v_field IN SELECT * FROM jsonb_array_elements(v_settings -> 'fields') LOOP
+      IF jsonb_typeof(v_field) <> 'object' THEN
+        RETURN false;
+      END IF;
+    END LOOP;
+  END IF;
+
+  RETURN true;
+END;
+$_$;
+
+
+ALTER FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "stats"."can_manage"("script_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -2987,15 +3186,37 @@ COMMENT ON COLUMN "payments"."accounts"."bonus_microcredits" IS 'The part of mic
 
 
 
+CREATE TABLE IF NOT EXISTS "payments"."agent_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_seen" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "ended_at" timestamp with time zone,
+    "end_reason" "payments"."session_end",
+    "active_seconds" integer DEFAULT 0 NOT NULL,
+    CONSTRAINT "agent_sessions_active_seconds_check" CHECK (("active_seconds" >= 0)),
+    CONSTRAINT "agent_sessions_end_check" CHECK ((("ended_at" IS NULL) = ("end_reason" IS NULL)))
+);
+
+
+ALTER TABLE "payments"."agent_sessions" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "payments"."agent_sessions" IS 'Free agent runs from the loader''s MCP server, metered but never billed. active_seconds adds the time between heartbeats, each gap capped by the API (2 x its heartbeat interval), so a loader that stalls or crashes is not counted past it. No FKs, like sessions.';
+
+
+
 CREATE TABLE IF NOT EXISTS "payments"."config" (
     "id" boolean DEFAULT true NOT NULL,
     "platform_fee_bps" integer DEFAULT 2000 NOT NULL,
     "session_timeout_minutes" integer DEFAULT 5 NOT NULL,
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
     "extra_session_fee" bigint DEFAULT 3000000 NOT NULL,
+    "max_agent_sessions" integer DEFAULT 8 NOT NULL,
     CONSTRAINT "config_check" CHECK ((("session_timeout_minutes" > 0) AND ("min_balance_minutes" > 0))),
     CONSTRAINT "config_extra_session_fee_check" CHECK (("extra_session_fee" >= 0)),
     CONSTRAINT "config_fee_check" CHECK ((("platform_fee_bps" >= 0) AND ("platform_fee_bps" <= 10000))),
+    CONSTRAINT "config_max_agent_sessions_check" CHECK (("max_agent_sessions" > 0)),
     CONSTRAINT "config_singleton" CHECK ("id")
 );
 
@@ -3016,6 +3237,10 @@ COMMENT ON COLUMN "payments"."config"."min_balance_minutes" IS 'A session needs 
 
 
 COMMENT ON COLUMN "payments"."config"."extra_session_fee" IS 'Microcredits every extra concurrent session of an account costs per 30 days of running (3000000 = 3 EUR). The oldest open session is free, and tester+ pay no fee.';
+
+
+
+COMMENT ON COLUMN "payments"."config"."max_agent_sessions" IS 'Open agent sessions an account may have at once.';
 
 
 
@@ -3360,7 +3585,8 @@ CREATE TABLE IF NOT EXISTS "scripts"."protected" (
     "revision" integer DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "last_revision" integer DEFAULT 0 NOT NULL
+    "last_revision" integer DEFAULT 0 NOT NULL,
+    "queueable" boolean DEFAULT false NOT NULL
 );
 
 
@@ -3432,8 +3658,10 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "status" "scripts"."version_status" DEFAULT 'pending'::"scripts"."version_status" NOT NULL,
     "sizes" bigint[] DEFAULT '{}'::bigint[] NOT NULL,
     "entry" "text" NOT NULL,
+    "manifest" "jsonb",
     CONSTRAINT "versions_entry_check" CHECK (("entry" = ANY ("files"))),
     CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
+    CONSTRAINT "versions_manifest_check" CHECK ("scripts"."valid_manifest"("manifest")),
     CONSTRAINT "versions_sizes_check" CHECK (((("cardinality"("sizes") = 0) OR ("cardinality"("sizes") = "cardinality"("files"))) AND (0 <= ALL ("sizes"))))
 );
 
@@ -3567,6 +3795,11 @@ ALTER TABLE ONLY "info"."documents"
 
 ALTER TABLE ONLY "payments"."accounts"
     ADD CONSTRAINT "accounts_pkey" PRIMARY KEY ("user_id");
+
+
+
+ALTER TABLE ONLY "payments"."agent_sessions"
+    ADD CONSTRAINT "agent_sessions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -3738,6 +3971,14 @@ CREATE INDEX "reports_script_id_idx" ON "feedback"."reports" USING "btree" ("scr
 
 
 CREATE INDEX "reports_user_id_idx" ON "feedback"."reports" USING "btree" ("user_id", "created_at" DESC);
+
+
+
+CREATE INDEX "agent_sessions_open_last_seen_idx" ON "payments"."agent_sessions" USING "btree" ("last_seen") WHERE ("ended_at" IS NULL);
+
+
+
+CREATE INDEX "agent_sessions_user_id_idx" ON "payments"."agent_sessions" USING "btree" ("user_id", "started_at" DESC);
 
 
 
@@ -4152,6 +4393,9 @@ CREATE POLICY "SELECT for OWNER" ON "payments"."sessions" FOR SELECT TO "authent
 ALTER TABLE "payments"."accounts" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "payments"."agent_sessions" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "payments"."config" ENABLE ROW LEVEL SECURITY;
 
 
@@ -4543,6 +4787,12 @@ GRANT ALL ON FUNCTION "payments"."charge_session"("p_session" "uuid", "p_minutes
 
 
 
+REVOKE ALL ON FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."end_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "payments"."end_session"("p_session" "uuid", "p_reason" "payments"."session_end") FROM PUBLIC;
 GRANT ALL ON FUNCTION "payments"."end_session"("p_session" "uuid", "p_reason" "payments"."session_end") TO "postgres";
 GRANT ALL ON FUNCTION "payments"."end_session"("p_session" "uuid", "p_reason" "payments"."session_end") TO "service_role";
@@ -4556,6 +4806,12 @@ GRANT ALL ON FUNCTION "payments"."end_stale_sessions"() TO "service_role";
 
 
 REVOKE ALL ON FUNCTION "payments"."end_user_sessions"("p_user" "uuid") FROM PUBLIC;
+
+
+
+REVOKE ALL ON FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) TO "postgres";
+GRANT ALL ON FUNCTION "payments"."heartbeat_agent_session"("p_user" "uuid", "p_session" "uuid", "p_max_gap" integer) TO "service_role";
 
 
 
@@ -4614,6 +4870,12 @@ GRANT ALL ON FUNCTION "payments"."session_rank"("p_session" "uuid") TO "service_
 
 REVOKE ALL ON FUNCTION "payments"."settle_payment"("p_payment" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "payments"."settle_payment"("p_payment" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "payments"."start_agent_session"("p_user" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "payments"."start_agent_session"("p_user" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "payments"."start_agent_session"("p_user" "uuid") TO "service_role";
 
 
 
@@ -4969,6 +5231,13 @@ GRANT ALL ON FUNCTION "scripts"."list_grantees"("p_script" "uuid") TO "service_r
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "anon";
 GRANT ALL ON FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") TO "service_role";
@@ -5049,6 +5318,13 @@ GRANT ALL ON FUNCTION "scripts"."valid_files"("files" "text"[]) TO "service_role
 
 
 
+REVOKE ALL ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."valid_manifest"("manifest" "jsonb") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "stats"."can_manage"("script_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "stats"."can_manage"("script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "stats"."can_manage"("script_id" "uuid") TO "service_role";
@@ -5116,6 +5392,11 @@ GRANT INSERT("content") ON TABLE "info"."documents" TO "authenticated";
 
 GRANT SELECT ON TABLE "payments"."accounts" TO "authenticated";
 GRANT SELECT ON TABLE "payments"."accounts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "payments"."agent_sessions" TO "postgres";
+GRANT SELECT ON TABLE "payments"."agent_sessions" TO "service_role";
 
 
 
@@ -5325,6 +5606,10 @@ GRANT INSERT("sizes") ON TABLE "scripts"."versions" TO "authenticated";
 
 
 GRANT INSERT("entry") ON TABLE "scripts"."versions" TO "authenticated";
+
+
+
+GRANT INSERT("manifest") ON TABLE "scripts"."versions" TO "authenticated";
 
 
 
