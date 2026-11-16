@@ -2009,7 +2009,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_
               SELECT role FROM profiles.profiles WHERE id = accesser_id
       ),
       script AS (
-              SELECT p.author, p.revision, m.type, m.stage, m.price, s.published,
+              SELECT p.author, p.revision, p.broken, m.type, m.stage, m.price, s.published,
                      a.role AS author_role, a.banned_at IS NOT NULL AS author_banned,
                      EXISTS (SELECT 1 FROM scripts.grants g WHERE g.script_id = s.id AND g.user_id = accesser_id) AS granted
               FROM scripts.scripts s
@@ -2024,6 +2024,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_access"("accesser_id" "uuid", "script_
                       SELECT
                               sc.revision > 0
                               AND (NOT sc.author_banned OR COALESCE(v.role >= 'moderator'::profiles.roles, false))
+                              AND (NOT sc.broken OR sc.author = accesser_id OR COALESCE(v.role >= 'moderator'::profiles.roles, false))
                               AND (
                               sc.author = accesser_id
                               OR v.role >= 'moderator'::profiles.roles
@@ -2105,6 +2106,7 @@ CREATE OR REPLACE FUNCTION "scripts"."can_view"("viewer_id" "uuid", "script_id" 
             WHEN COALESCE(v.role >= 'moderator'::profiles.roles, false) THEN true
             WHEN a.banned_at IS NOT NULL THEN false
             WHEN p.author = viewer_id THEN true
+            WHEN p.broken THEN false
             WHEN EXISTS (SELECT 1 FROM scripts.grants g WHERE g.script_id = s.id AND g.user_id = viewer_id) THEN true
             WHEN a.role < 'scripter'::profiles.roles THEN COALESCE(v.role >= 'tester'::profiles.roles, false)
             ELSE
@@ -2465,6 +2467,10 @@ BEGIN
     RAISE EXCEPTION 'revision % of script % has no encryption key', revision, script_id;
   END IF;
 
+  IF v_version.checked_lib IS NULL OR v_version.problems IS NOT NULL THEN
+    RAISE EXCEPTION 'revision % of script % has not passed the script check', revision, script_id USING ERRCODE = 'check_violation';
+  END IF;
+
   -- The real sizes of a community author's files have to fit their storage, whatever was declared
   IF scripts.author_is_community(script_id) THEN
     SELECT p.author INTO v_author FROM scripts.protected p WHERE p.id = script_id;
@@ -2476,17 +2482,47 @@ BEGIN
     END IF;
   END IF;
 
-  UPDATE scripts.versions v SET status = 'live', published_at = now()
+  UPDATE scripts.versions v SET status = 'live', published_at = now(), requires_host = v_version.checked_host
   WHERE v.id = script_id AND v.revision = publish_version.revision;
 
   UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now(),
-    queueable = COALESCE((v_version.manifest ->> 'queueable')::boolean, false)
+    queueable = COALESCE((v_version.manifest ->> 'queueable')::boolean, false), broken = false
   WHERE p.id = script_id;
 END;
 $$;
 
 
 ALTER FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $_$
+DECLARE
+  v_problems jsonb := NULLIF(p_problems, '[]'::jsonb);
+BEGIN
+  IF p_lib IS NULL OR p_lib !~ '^[0-9A-Za-z.-]{1,64}$' OR p_host IS NULL OR p_host < 0 THEN
+    RAISE EXCEPTION 'a check names the lib version and its host api' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  UPDATE scripts.versions v
+  SET checked_lib = p_lib, checked_host = p_host, checked_at = now(), problems = v_problems
+  WHERE v.id = p_script AND v.revision = p_revision
+    AND v.status IN ('pending'::scripts.version_status, 'live'::scripts.version_status);
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no pending or live revision % of script %', p_revision, p_script USING ERRCODE = 'no_data_found';
+  END IF;
+
+  UPDATE scripts.protected p SET broken = v_problems IS NOT NULL
+  WHERE p.id = p_script AND p.revision = p_revision;
+END;
+$_$;
+
+
+ALTER FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."redeem_share_code"("p_code" "text") RETURNS TABLE("status" "text", "script_id" "uuid", "url" "text")
@@ -2793,8 +2829,7 @@ BEGIN
     RAISE EXCEPTION 'a revision with several files needs an entry file' USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
-  -- A community author declares every file's size, and the revision has to fit what is left of
-  -- their storage. The declared sizes can lie: publish_version checks the real ones.
+  -- A community author declares each file's size; publish_version rechecks the real ones
   IF scripts.author_is_community(NEW.id) THEN
     IF cardinality(NEW.sizes) <> cardinality(NEW.files) THEN
       RAISE EXCEPTION 'every file needs its size' USING ERRCODE = 'check_violation';
@@ -3586,7 +3621,8 @@ CREATE TABLE IF NOT EXISTS "scripts"."protected" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_revision" integer DEFAULT 0 NOT NULL,
-    "queueable" boolean DEFAULT false NOT NULL
+    "queueable" boolean DEFAULT false NOT NULL,
+    "broken" boolean DEFAULT false NOT NULL
 );
 
 
@@ -3598,6 +3634,10 @@ COMMENT ON COLUMN "scripts"."protected"."revision" IS 'The live revision. 0 mean
 
 
 COMMENT ON COLUMN "scripts"."protected"."last_revision" IS 'Revision allocator. Counts pending and discarded revisions too.';
+
+
+
+COMMENT ON COLUMN "scripts"."protected"."broken" IS 'The live revision failed the script check against the newest lib (versions.problems). Copied here by record_check so listings can read it; only the author and moderator+ see a broken script.';
 
 
 
@@ -3659,9 +3699,16 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "sizes" bigint[] DEFAULT '{}'::bigint[] NOT NULL,
     "entry" "text" NOT NULL,
     "manifest" "jsonb",
+    "checked_lib" "text",
+    "checked_host" integer,
+    "checked_at" timestamp with time zone,
+    "problems" "jsonb",
+    "requires_host" integer,
+    CONSTRAINT "versions_check_complete" CHECK (((("checked_lib" IS NULL) = ("checked_host" IS NULL)) AND (("checked_lib" IS NULL) = ("checked_at" IS NULL)) AND (("problems" IS NULL) OR ("checked_lib" IS NOT NULL)))),
     CONSTRAINT "versions_entry_check" CHECK (("entry" = ANY ("files"))),
     CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
     CONSTRAINT "versions_manifest_check" CHECK ("scripts"."valid_manifest"("manifest")),
+    CONSTRAINT "versions_problems_check" CHECK ((("problems" IS NULL) OR (("jsonb_typeof"("problems") = 'array'::"text") AND ("jsonb_array_length"("problems") > 0) AND ("pg_column_size"("problems") <= 65536)))),
     CONSTRAINT "versions_sizes_check" CHECK (((("cardinality"("sizes") = 0) OR ("cardinality"("sizes") = "cardinality"("files"))) AND (0 <= ALL ("sizes"))))
 );
 
@@ -3674,6 +3721,18 @@ COMMENT ON COLUMN "scripts"."versions"."sizes" IS 'Byte size of each file in fil
 
 
 COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One of files. Left out on insert, it is the only file of a single-file revision (tr_versions_pre_insert); a revision with several files has to name it.';
+
+
+
+COMMENT ON COLUMN "scripts"."versions"."checked_lib" IS 'The lib version the revision was last type-checked against, and checked_host that lib''s requires_host. Set only by record_check (the api service).';
+
+
+
+COMMENT ON COLUMN "scripts"."versions"."problems" IS 'What the last check found, as [{ file, line, column, message }]; null when it passed. A pending revision with problems can''t be published.';
+
+
+
+COMMENT ON COLUMN "scripts"."versions"."requires_host" IS 'The host api of the lib the revision passed when it went live, set by publish_version. Later checks don''t change it, so a loader whose injector is older refuses only revisions published against a newer lib.';
 
 
 
@@ -5254,6 +5313,12 @@ REVOKE ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision
 GRANT ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) TO "postgres";
 GRANT ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") TO "service_role";
 
 
 
