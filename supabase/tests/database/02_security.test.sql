@@ -34,7 +34,8 @@ INSERT INTO scripts.scripts (id, title, description, content) VALUES ('10000000-
 -- give the first script a live revision
 INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/main.luau');
 INSERT INTO scripts.version_keys (id, revision, key) VALUES ('10000000-0000-0000-0000-000000000001', 1, decode(repeat('ab', 32), 'hex'));
-SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', 0, NULL);
+SELECT scripts.register_injector('test', 1);
+SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', NULL);
 SET LOCAL ROLE authenticated;
 SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1);
 RESET ROLE;

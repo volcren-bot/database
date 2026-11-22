@@ -19,7 +19,8 @@ END;
 $$;
 
 CREATE FUNCTION pg_temp.pass(p_script uuid, p_revision integer) RETURNS void LANGUAGE sql SECURITY DEFINER AS $$
-  SELECT scripts.record_check(p_script, p_revision, 'test', 0, NULL);
+  SELECT scripts.register_injector('test', 1);
+  SELECT scripts.record_check(p_script, p_revision, 'test', NULL);
 $$;
 
 CREATE FUNCTION pg_temp.publish(p_script uuid, p_revision integer) RETURNS void LANGUAGE plpgsql AS $$

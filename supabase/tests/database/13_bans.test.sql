@@ -22,7 +22,8 @@ BEGIN
   INSERT INTO scripts.versions (id, files) VALUES (p_id, ARRAY['main.luau']);
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_id || '/000000001/main.luau');
   INSERT INTO scripts.version_keys (id, revision, key) VALUES (p_id, 1, decode(repeat('ab', 32), 'hex'));
-  PERFORM scripts.record_check(p_id, 1, 'test', 0, NULL);
+  PERFORM scripts.register_injector('test', 1);
+  PERFORM scripts.record_check(p_id, 1, 'test', NULL);
   SET LOCAL ROLE authenticated;
   PERFORM scripts.publish_version(p_id, 1);
   RESET ROLE;
@@ -52,7 +53,7 @@ SELECT throws_ok($$SELECT profiles.set_banned('00000000-0000-0000-0000-000000000
 SELECT is((SELECT count(*)::int FROM profiles.bans), 0, 'refused bans are not recorded');
 
 -- a ban ends running scripts
-CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint);
+CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint, injector text);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 UPDATE payments.sessions SET started_at = started_at - interval '3 minutes', charged_until = charged_until - interval '3 minutes';
 

@@ -22,7 +22,8 @@ BEGIN
   INSERT INTO scripts.versions (id, files) VALUES (p_id, ARRAY['main.luau']);
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_id || '/000000001/main.luau');
   INSERT INTO scripts.version_keys (id, revision, key) VALUES (p_id, 1, decode(repeat('ab', 32), 'hex'));
-  PERFORM scripts.record_check(p_id, 1, 'test', 0, NULL);
+  PERFORM scripts.register_injector('test', 1);
+  PERFORM scripts.record_check(p_id, 1, 'test', NULL);
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', p_author, 'role', 'authenticated')::text, true);
   SET LOCAL ROLE authenticated;
   PERFORM scripts.publish_version(p_id, 1);
@@ -48,7 +49,7 @@ UPDATE payments.config SET extra_session_fee = 30000;
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000002', 'adjustment', 1000);
 SELECT payments.post_credits('00000000-0000-0000-0000-000000000004', 'adjustment', 9);
 
-CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[], entry text, rank int, fee bigint);
+CREATE TEMP TABLE s (name text PRIMARY KEY, id uuid, revision int, files text[], entry text, rank int, fee bigint, injector text);
 
 -- starting
 INSERT INTO s SELECT 'a', * FROM payments.start_session('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001');

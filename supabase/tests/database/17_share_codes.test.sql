@@ -28,7 +28,8 @@ BEGIN
   INSERT INTO scripts.versions (id, files) VALUES (p_id, ARRAY['main.luau']);
   INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', p_id || '/000000001/main.luau');
   INSERT INTO scripts.version_keys (id, revision, key) VALUES (p_id, 1, decode(repeat('ab', 32), 'hex'));
-  PERFORM scripts.record_check(p_id, 1, 'test', 0, NULL);
+  PERFORM scripts.register_injector('test', 1);
+  PERFORM scripts.record_check(p_id, 1, 'test', NULL);
   SET LOCAL ROLE authenticated;
   PERFORM scripts.publish_version(p_id, 1);
   RESET ROLE;
@@ -226,7 +227,7 @@ RESET ROLE;
 UPDATE scripts.scripts SET published = true WHERE id = '10000000-0000-0000-0000-000000000001';
 SELECT pg_temp.act('00000000-0000-0000-0000-000000000004');
 SELECT set_config('request.jwt.claims', '{"role":"service_role"}', true);
-CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint);
+CREATE TEMP TABLE s (id uuid, revision int, files text[], entry text, rank int, fee bigint, injector text);
 INSERT INTO s SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001');
 SELECT is((SELECT price FROM payments.sessions WHERE id = (SELECT id FROM s)), 0::bigint, 'a grantee runs a premium script at price 0 without credits');
 SELECT throws_ok($$SELECT * FROM payments.start_session('00000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001')$$, '42501', 'script not accessible', 'while someone without a grant or credits cannot');

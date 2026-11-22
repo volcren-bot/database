@@ -74,7 +74,8 @@ SELECT throws_ok($$SELECT scripts.use_deploy_token('10000000-0000-0000-0000-0000
 INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau']);
 INSERT INTO storage.objects (bucket_id, name) VALUES ('scripts', '10000000-0000-0000-0000-000000000001/000000001/main.luau');
 SELECT lives_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, 'service_role can set a revision key');
-SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', 0, NULL);
+SELECT scripts.register_injector('test', 1);
+SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', NULL);
 SELECT lives_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, 'service_role can publish');
 INSERT INTO scripts.versions (id, files) VALUES ('10000000-0000-0000-0000-000000000001', ARRAY['main.luau']);
 SELECT lives_ok($$SELECT scripts.discard_version('10000000-0000-0000-0000-000000000001', 2)$$, 'and discard');

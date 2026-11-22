@@ -68,7 +68,8 @@ SELECT throws_ok($$SELECT key FROM scripts.version_keys$$, '42501', NULL, 'clien
 SELECT lives_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('ab', 32))$$, 'the author sets the key');
 SELECT throws_ok($$SELECT scripts.set_version_key('10000000-0000-0000-0000-000000000001', 1, repeat('cd', 32))$$, '23505', NULL, 'once');
 RESET ROLE;
-SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', 0, NULL);
+SELECT scripts.register_injector('test', 1);
+SELECT scripts.record_check('10000000-0000-0000-0000-000000000001', 1, 'test', NULL);
 SET LOCAL ROLE authenticated;
 SELECT lives_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000000001', 1)$$, 'publishing after all uploads succeeds');
 RESET ROLE;

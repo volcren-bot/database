@@ -507,8 +507,8 @@ BEGIN
 END;
 $$;
 
--- Starts a session at a fixed price (service_role) and returns the live revision's files
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint)
+-- Starts a session at a fixed price (service_role) and returns the live revision's files and the injector it runs on
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE ("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint, "injector" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -520,6 +520,7 @@ DECLARE
   v_price bigint;
   v_files text[];
   v_entry text;
+  v_injector text;
   v_id uuid;
   v_rank integer;
   v_fee bigint;
@@ -538,11 +539,15 @@ BEGIN
   JOIN scripts.metadata m ON m.id = p.id
   WHERE p.id = p_script;
 
-  SELECT v.files, v.entry INTO v_files, v_entry FROM scripts.versions v
+  SELECT v.files, v.entry, v.injector INTO v_files, v_entry, v_injector FROM scripts.versions v
   WHERE v.id = p_script AND v.revision = v_revision AND v.status = 'live'::scripts.version_status;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'script % has no live revision', p_script;
+  END IF;
+
+  IF v_injector IS NULL OR EXISTS (SELECT 1 FROM scripts.injectors i WHERE i.version = v_injector AND i.retired_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'the live revision of script % runs on an injector that is no longer supported', p_script USING ERRCODE = 'object_not_in_prerequisite_state';
   END IF;
 
   v_price := CASE
@@ -563,7 +568,7 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee, v_injector;
 END;
 $$;
 
