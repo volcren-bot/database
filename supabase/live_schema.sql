@@ -1166,7 +1166,7 @@ $$;
 ALTER FUNCTION "payments"."start_agent_session"("p_user" "uuid") OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint)
+CREATE OR REPLACE FUNCTION "payments"."start_session"("p_user" "uuid", "p_script" "uuid") RETURNS TABLE("session_id" "uuid", "revision" integer, "files" "text"[], "entry" "text", "rank" integer, "fee" bigint, "injector" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
@@ -1178,6 +1178,7 @@ DECLARE
   v_price bigint;
   v_files text[];
   v_entry text;
+  v_injector text;
   v_id uuid;
   v_rank integer;
   v_fee bigint;
@@ -1196,11 +1197,15 @@ BEGIN
   JOIN scripts.metadata m ON m.id = p.id
   WHERE p.id = p_script;
 
-  SELECT v.files, v.entry INTO v_files, v_entry FROM scripts.versions v
+  SELECT v.files, v.entry, v.injector INTO v_files, v_entry, v_injector FROM scripts.versions v
   WHERE v.id = p_script AND v.revision = v_revision AND v.status = 'live'::scripts.version_status;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'script % has no live revision', p_script;
+  END IF;
+
+  IF v_injector IS NULL OR EXISTS (SELECT 1 FROM scripts.injectors i WHERE i.version = v_injector AND i.retired_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'the live revision of script % runs on an injector that is no longer supported', p_script USING ERRCODE = 'object_not_in_prerequisite_state';
   END IF;
 
   v_price := CASE
@@ -1221,7 +1226,7 @@ BEGIN
   VALUES (p_user, p_script, v_author, v_revision, v_price)
   RETURNING s.id INTO v_id;
 
-  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee;
+  RETURN QUERY SELECT v_id, v_revision, v_files, v_entry, v_rank, v_fee, v_injector;
 END;
 $$;
 
@@ -2467,8 +2472,12 @@ BEGIN
     RAISE EXCEPTION 'revision % of script % has no encryption key', revision, script_id;
   END IF;
 
-  IF v_version.checked_lib IS NULL OR v_version.problems IS NOT NULL THEN
+  IF v_version.checked_injector IS NULL OR v_version.problems IS NOT NULL THEN
     RAISE EXCEPTION 'revision % of script % has not passed the script check', revision, script_id USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM scripts.injectors i WHERE i.version = v_version.checked_injector AND i.retired_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'revision % of script % was checked against retired injector %', revision, script_id, v_version.checked_injector USING ERRCODE = 'check_violation';
   END IF;
 
   -- The real sizes of a community author's files have to fit their storage, whatever was declared
@@ -2482,7 +2491,7 @@ BEGIN
     END IF;
   END IF;
 
-  UPDATE scripts.versions v SET status = 'live', published_at = now(), requires_host = v_version.checked_host
+  UPDATE scripts.versions v SET status = 'live', published_at = now(), injector = v_version.checked_injector
   WHERE v.id = script_id AND v.revision = publish_version.revision;
 
   UPDATE scripts.protected p SET revision = publish_version.revision, updated_at = now(),
@@ -2495,34 +2504,50 @@ $$;
 ALTER FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision" integer) OWNER TO "supabase_admin";
 
 
-CREATE OR REPLACE FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_injector" "text", "p_problems" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO ''
     SET "row_security" TO 'off'
-    AS $_$
+    AS $$
 DECLARE
   v_problems jsonb := NULLIF(p_problems, '[]'::jsonb);
+  v_checked scripts.injectors;
+  v_version scripts.versions;
 BEGIN
-  IF p_lib IS NULL OR p_lib !~ '^[0-9A-Za-z.-]{1,64}$' OR p_host IS NULL OR p_host < 0 THEN
-    RAISE EXCEPTION 'a check names the lib version and its host api' USING ERRCODE = 'invalid_parameter_value';
+  SELECT * INTO v_checked FROM scripts.injectors i WHERE i.version = p_injector;
+
+  IF NOT FOUND OR v_checked.retired_at IS NOT NULL THEN
+    RAISE EXCEPTION 'a check names a registered injector that isn''t retired' USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
   UPDATE scripts.versions v
-  SET checked_lib = p_lib, checked_host = p_host, checked_at = now(), problems = v_problems
+  SET checked_injector = p_injector, checked_at = now(), problems = v_problems
   WHERE v.id = p_script AND v.revision = p_revision
-    AND v.status IN ('pending'::scripts.version_status, 'live'::scripts.version_status);
+    AND v.status IN ('pending'::scripts.version_status, 'live'::scripts.version_status)
+  RETURNING * INTO v_version;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no pending or live revision % of script %', p_revision, p_script USING ERRCODE = 'no_data_found';
   END IF;
 
-  UPDATE scripts.protected p SET broken = v_problems IS NOT NULL
-  WHERE p.id = p_script AND p.revision = p_revision;
+  IF v_version.status = 'live'::scripts.version_status
+     AND v_problems IS NULL
+     AND COALESCE((v_version.manifest ->> 'auto_forward')::boolean, true)
+     AND NOT EXISTS (
+       SELECT 1 FROM scripts.injectors pinned
+       WHERE pinned.version = v_version.injector AND pinned.retired_at IS NULL AND pinned.build >= v_checked.build
+     ) THEN
+    UPDATE scripts.versions v SET injector = p_injector
+    WHERE v.id = p_script AND v.revision = p_revision;
+
+    UPDATE scripts.protected p SET broken = false
+    WHERE p.id = p_script AND p.revision = p_revision;
+  END IF;
 END;
-$_$;
+$$;
 
 
-ALTER FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") OWNER TO "supabase_admin";
+ALTER FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_injector" "text", "p_problems" "jsonb") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."redeem_share_code"("p_code" "text") RETURNS TABLE("status" "text", "script_id" "uuid", "url" "text")
@@ -2603,6 +2628,52 @@ $_$;
 
 
 ALTER FUNCTION "scripts"."redeem_share_code"("p_code" "text") OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  INSERT INTO scripts.injectors (version, build) VALUES (p_version, p_build)
+  ON CONFLICT (version) DO NOTHING;
+
+  IF NOT EXISTS (SELECT 1 FROM scripts.injectors i WHERE i.version = p_version AND i.build = p_build) THEN
+    RAISE EXCEPTION 'injector % is registered with another build', p_version USING ERRCODE = 'unique_violation';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) OWNER TO "supabase_admin";
+
+
+CREATE OR REPLACE FUNCTION "scripts"."retire_injector"("p_version" "text") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_broken integer;
+BEGIN
+  UPDATE scripts.injectors i SET retired_at = COALESCE(i.retired_at, now()) WHERE i.version = p_version;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'injector % is not registered', p_version USING ERRCODE = 'no_data_found';
+  END IF;
+
+  UPDATE scripts.protected p SET broken = true
+  FROM scripts.versions v
+  WHERE v.id = p.id AND v.revision = p.revision AND v.injector = p_version AND NOT p.broken;
+  GET DIAGNOSTICS v_broken = ROW_COUNT;
+
+  RETURN v_broken;
+END;
+$$;
+
+
+ALTER FUNCTION "scripts"."retire_injector"("p_version" "text") OWNER TO "supabase_admin";
 
 
 CREATE OR REPLACE FUNCTION "scripts"."safe_uuid"("value" "text") RETURNS "uuid"
@@ -2913,11 +2984,15 @@ BEGIN
     RETURN false;
   END IF;
 
-  IF EXISTS (SELECT 1 FROM jsonb_object_keys(manifest) k WHERE k NOT IN ('queueable', 'goals', 'settings', 'finish_grace_minutes')) THEN
+  IF EXISTS (SELECT 1 FROM jsonb_object_keys(manifest) k WHERE k NOT IN ('queueable', 'goals', 'settings', 'finish_grace_minutes', 'auto_forward')) THEN
     RETURN false;
   END IF;
 
   IF manifest ? 'queueable' AND jsonb_typeof(manifest -> 'queueable') <> 'boolean' THEN
+    RETURN false;
+  END IF;
+
+  IF manifest ? 'auto_forward' AND jsonb_typeof(manifest -> 'auto_forward') <> 'boolean' THEN
     RETURN false;
   END IF;
 
@@ -3596,6 +3671,27 @@ CREATE TABLE IF NOT EXISTS "scripts"."grants" (
 ALTER TABLE "scripts"."grants" OWNER TO "supabase_admin";
 
 
+CREATE TABLE IF NOT EXISTS "scripts"."injectors" (
+    "version" "text" NOT NULL,
+    "build" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "retired_at" timestamp with time zone,
+    CONSTRAINT "injectors_build_check" CHECK (("build" > 0)),
+    CONSTRAINT "injectors_version_check" CHECK (("version" ~ '^[0-9A-Za-z.-]{1,64}$'::"text"))
+);
+
+
+ALTER TABLE "scripts"."injectors" OWNER TO "supabase_admin";
+
+
+COMMENT ON TABLE "scripts"."injectors" IS 'Client releases (version YYYY.MM.DD-<sha7>, build = commit time) whose injector.exe and SDK revisions are checked against and pinned to. Ordered by build.';
+
+
+
+COMMENT ON COLUMN "scripts"."injectors"."retired_at" IS 'Set by retire_injector once the release can no longer run (an IPC or game-update break). Every revision pinned to it stops being runnable.';
+
+
+
 CREATE TABLE IF NOT EXISTS "scripts"."metadata" (
     "id" "uuid" NOT NULL,
     "type" "scripts"."type" DEFAULT 'free'::"scripts"."type" NOT NULL,
@@ -3637,7 +3733,7 @@ COMMENT ON COLUMN "scripts"."protected"."last_revision" IS 'Revision allocator. 
 
 
 
-COMMENT ON COLUMN "scripts"."protected"."broken" IS 'The live revision failed the script check against the newest lib (versions.problems). Copied here by record_check so listings can read it; only the author and moderator+ see a broken script.';
+COMMENT ON COLUMN "scripts"."protected"."broken" IS 'The live revision can''t run: it has no injector, or its injector was retired (retire_injector). Cleared when a revision goes live or record_check moves the live one onto a supported injector; only the author and moderator+ see a broken script.';
 
 
 
@@ -3699,12 +3795,11 @@ CREATE TABLE IF NOT EXISTS "scripts"."versions" (
     "sizes" bigint[] DEFAULT '{}'::bigint[] NOT NULL,
     "entry" "text" NOT NULL,
     "manifest" "jsonb",
-    "checked_lib" "text",
-    "checked_host" integer,
     "checked_at" timestamp with time zone,
     "problems" "jsonb",
-    "requires_host" integer,
-    CONSTRAINT "versions_check_complete" CHECK (((("checked_lib" IS NULL) = ("checked_host" IS NULL)) AND (("checked_lib" IS NULL) = ("checked_at" IS NULL)) AND (("problems" IS NULL) OR ("checked_lib" IS NOT NULL)))),
+    "checked_injector" "text",
+    "injector" "text",
+    CONSTRAINT "versions_check_complete" CHECK (((("checked_injector" IS NULL) = ("checked_at" IS NULL)) AND (("problems" IS NULL) OR ("checked_injector" IS NOT NULL)))),
     CONSTRAINT "versions_entry_check" CHECK (("entry" = ANY ("files"))),
     CONSTRAINT "versions_files_check" CHECK ("scripts"."valid_files"("files")),
     CONSTRAINT "versions_manifest_check" CHECK ("scripts"."valid_manifest"("manifest")),
@@ -3724,15 +3819,15 @@ COMMENT ON COLUMN "scripts"."versions"."entry" IS 'The file the loader runs. One
 
 
 
-COMMENT ON COLUMN "scripts"."versions"."checked_lib" IS 'The lib version the revision was last type-checked against, and checked_host that lib''s requires_host. Set only by record_check (the api service).';
-
-
-
 COMMENT ON COLUMN "scripts"."versions"."problems" IS 'What the last check found, as [{ file, line, column, message }]; null when it passed. A pending revision with problems can''t be published.';
 
 
 
-COMMENT ON COLUMN "scripts"."versions"."requires_host" IS 'The host api of the lib the revision passed when it went live, set by publish_version. Later checks don''t change it, so a loader whose injector is older refuses only revisions published against a newer lib.';
+COMMENT ON COLUMN "scripts"."versions"."checked_injector" IS 'The client release whose SDK the revision was last type-checked against. Set only by record_check (the api service).';
+
+
+
+COMMENT ON COLUMN "scripts"."versions"."injector" IS 'The client release the loader runs the revision with. publish_version pins the one it passed; record_check moves a live revision to a newer one it passes, unless its manifest sets auto_forward to false.';
 
 
 
@@ -3934,6 +4029,11 @@ ALTER TABLE ONLY "scripts"."deploy_tokens"
 
 ALTER TABLE ONLY "scripts"."grants"
     ADD CONSTRAINT "grants_pkey" PRIMARY KEY ("script_id", "user_id");
+
+
+
+ALTER TABLE ONLY "scripts"."injectors"
+    ADD CONSTRAINT "injectors_pkey" PRIMARY KEY ("version");
 
 
 
@@ -4350,7 +4450,17 @@ ALTER TABLE ONLY "scripts"."version_keys"
 
 
 ALTER TABLE ONLY "scripts"."versions"
+    ADD CONSTRAINT "versions_checked_injector_fkey" FOREIGN KEY ("checked_injector") REFERENCES "scripts"."injectors"("version") ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "scripts"."versions"
     ADD CONSTRAINT "versions_id_fkey" FOREIGN KEY ("id") REFERENCES "scripts"."scripts"("id") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "scripts"."versions"
+    ADD CONSTRAINT "versions_injector_fkey" FOREIGN KEY ("injector") REFERENCES "scripts"."injectors"("version") ON DELETE RESTRICT;
 
 
 
@@ -4562,6 +4672,10 @@ CREATE POLICY "SELECT for EVERYONE" ON "scripts"."config" FOR SELECT USING (true
 
 
 
+CREATE POLICY "SELECT for EVERYONE" ON "scripts"."injectors" FOR SELECT USING (true);
+
+
+
 CREATE POLICY "SELECT for HOLDER and AUTHOR" ON "scripts"."grants" FOR SELECT TO "authenticated" USING ((("user_id" = "profiles"."uid"()) OR "profiles"."min_role"("profiles"."uid"(), 'moderator'::"profiles"."roles") OR "scripts"."is_author"("profiles"."uid"(), "script_id")));
 
 
@@ -4588,6 +4702,9 @@ ALTER TABLE "scripts"."deploy_tokens" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "scripts"."grants" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "scripts"."injectors" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "scripts"."metadata" ENABLE ROW LEVEL SECURITY;
@@ -5316,9 +5433,9 @@ GRANT ALL ON FUNCTION "scripts"."publish_version"("script_id" "uuid", "revision"
 
 
 
-REVOKE ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") FROM PUBLIC;
-GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") TO "postgres";
-GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_lib" "text", "p_host" integer, "p_problems" "jsonb") TO "service_role";
+REVOKE ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_injector" "text", "p_problems" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_injector" "text", "p_problems" "jsonb") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."record_check"("p_script" "uuid", "p_revision" integer, "p_injector" "text", "p_problems" "jsonb") TO "service_role";
 
 
 
@@ -5326,6 +5443,18 @@ REVOKE ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") FROM PUBLI
 GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "postgres";
 GRANT ALL ON FUNCTION "scripts"."redeem_share_code"("p_code" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."retire_injector"("p_version" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."retire_injector"("p_version" "text") TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."retire_injector"("p_version" "text") TO "service_role";
 
 
 
@@ -5576,6 +5705,13 @@ GRANT SELECT("user_id") ON TABLE "scripts"."grants" TO "authenticated";
 
 
 GRANT SELECT("granted_at") ON TABLE "scripts"."grants" TO "authenticated";
+
+
+
+GRANT SELECT ON TABLE "scripts"."injectors" TO "anon";
+GRANT SELECT ON TABLE "scripts"."injectors" TO "authenticated";
+GRANT ALL ON TABLE "scripts"."injectors" TO "postgres";
+GRANT ALL ON TABLE "scripts"."injectors" TO "service_role";
 
 
 
