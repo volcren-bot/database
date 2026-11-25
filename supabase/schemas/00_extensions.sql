@@ -12,3 +12,5 @@ SELECT cron.schedule('stats-refresh-totals', '*/10 * * * *', $$REFRESH MATERIALI
 
 -- Bug report attachments are kept for 90 days
 SELECT cron.schedule('feedback-clear-old-attachments', '23 3 * * *', $$SELECT feedback.clear_old_attachments()$$);
+
+SELECT cron.schedule('webhooks-delete-old-deliveries', '41 4 * * *', $$SELECT webhooks.delete_old_deliveries()$$);

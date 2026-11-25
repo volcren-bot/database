@@ -17,7 +17,7 @@ Production is migrated by pasting files into the Supabase SQL editor, which does
 
 ## Conventions every function and table follows
 
-- Schema files apply in filename order (`00_extensions` → `08_feedback`). Cross-schema references at call time are fine (`scripts.can_access` reads `payments.accounts`); at definition time they are not.
+- Schema files apply in filename order (`00_extensions` → `09_webhooks`). Cross-schema references at call time are fine (`scripts.can_access` reads `payments.accounts`); at definition time they are not.
 - Every function: `SET "search_path" TO ''` and fully qualified names (`extensions.hmac`, `auth.uid()`).
 - Functions are executable by `PUBLIC` by default. After defining one, `REVOKE ALL ... FROM PUBLIC, "anon", "authenticated"` and grant back only the roles that need it. RLS helpers (`profiles.min_role`, `profiles.uid`, ...) must stay granted to `anon`, since policies call them for anonymous visitors.
 - Session functions (`payments.start_session`, `heartbeat_session`, `end_session` and their `*_agent_session` counterparts) are `service_role` only: the API calls them, never clients.
@@ -54,6 +54,13 @@ Production is migrated by pasting files into the Supabase SQL editor, which does
 - **Scores** are one row per user per script (1-10); scoring again replaces it and records the session and revision. Authors read `feedback.score_summary` (count, average, 1-10 histogram), never the rows; moderator+ and the scorer read the rows.
 - **Reports** hold the description (2000 chars), the script log (256 KiB), a game state snapshot (64 KiB) and diagnostics (16 KiB), all capped by CHECK constraints. At most 5 an hour per user, serialised with an advisory lock. Visible to the reporter, the script's author, the assigned tester and moderator+ (`feedback.can_view_report`); `feedback.list_reports` is the only way to see the reporter's and assignee's usernames and leaves the attachments out. Clients may change only `status` and `assigned_to` (column grants plus `tr_reports_pre_update`): the author, assignee and moderator+ set the status, the author and moderator+ assign, and an assignee must be tester+ (`feedback.list_testers` lists them for authors and moderator+). The reporter and moderator+ delete.
 - `feedback.clear_old_attachments` runs daily from pg_cron and nulls the attachments of reports older than 90 days; the rows stay.
+
+## Webhooks (schema `webhooks`)
+
+- Contributor+ accounts that aren't banned (`webhooks.can_use`) register up to 5 HTTPS endpoints each for `client_release` and `script_check` events; `ping` is the test `webhooks.send_test` queues (one pending per endpoint, 10 an hour per account). The API sends what is queued; the database only queues and records.
+- **Events are queued by the database**, so each happens once: `tr_injectors_released` on a new `scripts.injectors` row (the API registers a release once it is published, so it is downloadable when the event goes out), and `scripts.record_check` for a live revision, to the script's author only, with the first 10 problems. Checks of pending uploads aren't sent.
+- **Secrets are write-only.** Clients change endpoints only through `webhooks.save_endpoint`, which validates the URL (https, a host name, no credentials) and up to 8 custom headers (no reserved, hop-by-hop or `X-Volcren-*` names, printable ASCII). A null bearer token or header value keeps the stored one, and an empty token clears it. Column grants keep `bearer_token` and `header_values` from every client; owners see `has_bearer`, `header_names` and the `signing_secret` they verify signatures with (`rotate_signing_secret`).
+- **Delivery**: `claim_deliveries` (`service_role`) leases due rows for 2 minutes with `SKIP LOCKED` and first fails the pending ones of endpoints that were turned off or whose owner lost access. `finish_delivery` records each attempt: a 2xx delivers and resets the endpoint's `failures`; a retryable failure waits 1 min, 5 min, 30 min, 2 h, then 6 h, for 6 attempts in all; 15 failed attempts in a row turn the endpoint off with a `disabled_reason`, and turning it back on clears both. Pings get one attempt and never count. `delete_old_deliveries` runs daily from pg_cron and drops deliveries finished over 30 days ago.
 
 ## Privacy rules
 

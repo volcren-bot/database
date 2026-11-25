@@ -53,7 +53,7 @@ echo "Dumping schemas and storage policies..."
 	echo "-- Live database snapshot, generated nightly by the sync task. Do not edit:"
 	echo "-- the source of truth is supabase/schemas/ and supabase/migrations/."
 	echo
-	dump 'public|profiles|scripts|stats|payments|info|feedback'
+	dump 'public|profiles|scripts|stats|payments|info|feedback|webhooks'
 	echo
 	echo "-- RLS policies for Supabase's storage schema (extracted from a full storage dump)."
 	echo
@@ -64,7 +64,7 @@ echo "Dumping schemas and storage policies..."
 } > "$SNAPSHOT"
 
 if grep -inE "secret|api_key|password|token|key_id" "$SNAPSHOT" \
-	| grep -ivE "secret_key|secret text|secret IS NULL|decrypted_secret|WEBHOOK_SECRET|generate_hmac|path_tokens|deploy[_ ]token|token_hash|x-simba-secret', *[a-z_]+\b"; then
+	| grep -ivE "secret_key|secret text|secret IS NULL|decrypted_secret|WEBHOOK_SECRET|generate_hmac|path_tokens|deploy[_ ]token|token_hash|bearer_token|signing_secret|x-simba-secret', *[a-z_]+\b"; then
 	echo "Potential secret found in schema dump, aborting." >&2
 	exit 1
 fi
