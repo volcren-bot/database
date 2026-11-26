@@ -2542,6 +2542,24 @@ BEGIN
 
     UPDATE scripts.protected p SET broken = false
     WHERE p.id = p_script AND p.revision = p_revision;
+
+    v_version.injector := p_injector;
+  END IF;
+
+  IF v_version.status = 'live'::scripts.version_status THEN
+    PERFORM webhooks.enqueue('script_check'::webhooks.event, jsonb_build_object(
+        'script_id', p_script,
+        'title', s.title,
+        'url', s.url,
+        'revision', p_revision,
+        'checked_injector', p_injector,
+        'injector', v_version.injector,
+        'passed', v_problems IS NULL,
+        'problem_count', COALESCE(jsonb_array_length(v_problems), 0),
+        'problems', COALESCE((SELECT jsonb_agg(pr.value ORDER BY pr.ordinality) FROM jsonb_array_elements(v_problems) WITH ORDINALITY pr WHERE pr.ordinality <= 10), '[]'::jsonb)),
+      pt.author)
+    FROM scripts.scripts s JOIN scripts.protected pt ON pt.id = s.id
+    WHERE s.id = p_script;
   END IF;
 END;
 $$;
@@ -4270,6 +4288,10 @@ CREATE OR REPLACE TRIGGER "tr_profiles_pre_delete" BEFORE DELETE ON "profiles"."
 
 
 CREATE OR REPLACE TRIGGER "tr_profiles_role_change" BEFORE UPDATE OF "role" ON "profiles"."profiles" FOR EACH ROW WHEN (("old"."role" IS DISTINCT FROM "new"."role")) EXECUTE FUNCTION "profiles"."tr_profiles_role_change"();
+
+
+
+CREATE OR REPLACE TRIGGER "tr_injectors_released" AFTER INSERT ON "scripts"."injectors" FOR EACH ROW EXECUTE FUNCTION "webhooks"."tr_injectors_released"();
 
 
 
