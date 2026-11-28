@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS "profiles"."profiles" (
     "avatar" "text" DEFAULT ''::"text" NOT NULL,
     "role" "profiles"."roles" DEFAULT 'user'::"profiles"."roles" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "banned_at" timestamp with time zone
+    "banned_at" timestamp with time zone,
+    "referral_code" "text" DEFAULT "encode"("extensions"."gen_random_bytes"(6), 'hex'::"text") NOT NULL
 );
 
 
@@ -35,6 +36,9 @@ COMMENT ON COLUMN "profiles"."profiles"."banned_at" IS 'Set while the account is
 
 ALTER TABLE ONLY "profiles"."profiles"
     ADD CONSTRAINT "profiles_pkey" PRIMARY KEY ("id");
+
+ALTER TABLE ONLY "profiles"."profiles"
+    ADD CONSTRAINT "profiles_referral_code_key" UNIQUE ("referral_code");
 
 -- Discord's own limits: 2-32 characters, no control characters, no padding
 ALTER TABLE ONLY "profiles"."profiles"

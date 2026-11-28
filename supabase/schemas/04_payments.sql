@@ -13,7 +13,7 @@ CREATE TYPE "payments"."provider" AS ENUM ('bitcart', 'stripe', 'molly');
 CREATE TYPE "payments"."payment_status" AS ENUM ('pending', 'paid', 'expired', 'invalid');
 
 
-CREATE TYPE "payments"."credit_kind" AS ENUM ('topup', 'usage', 'transfer', 'refund', 'adjustment');
+CREATE TYPE "payments"."credit_kind" AS ENUM ('topup', 'usage', 'transfer', 'refund', 'adjustment', 'referral');
 
 
 CREATE TYPE "payments"."earning_kind" AS ENUM ('sale', 'transfer', 'withdrawal', 'adjustment');
@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS "payments"."config" (
     "min_balance_minutes" integer DEFAULT 1 NOT NULL,
     "extra_session_fee" bigint DEFAULT 3000000 NOT NULL,
     "max_agent_sessions" integer DEFAULT 8 NOT NULL,
+    "referral_gift" bigint DEFAULT 500000 NOT NULL,
+    "referral_runtime_reward" bigint DEFAULT 250000 NOT NULL,
+    "referral_runtime_scripts" integer DEFAULT 4 NOT NULL,
+    "referral_runtime_minutes" integer DEFAULT 120 NOT NULL,
+    "referral_runtime_days" integer DEFAULT 2 NOT NULL,
+    "referral_invite_reward" bigint DEFAULT 100000 NOT NULL,
+    "referral_invites" integer DEFAULT 10 NOT NULL,
+    "referral_topup_reward" bigint DEFAULT 1000000 NOT NULL,
+    "referral_min_discord_days" integer DEFAULT 30 NOT NULL,
+    CONSTRAINT "config_referral_check" CHECK (
+        "referral_gift" >= 0 AND "referral_runtime_reward" >= 0 AND "referral_invite_reward" >= 0 AND "referral_topup_reward" >= 0
+        AND "referral_runtime_scripts" >= 0 AND "referral_invites" >= 0
+        AND "referral_runtime_minutes" > 0 AND "referral_runtime_days" > 0 AND "referral_min_discord_days" >= 0
+    ),
     CONSTRAINT "config_singleton" CHECK ("id"),
     CONSTRAINT "config_max_agent_sessions_check" CHECK ("max_agent_sessions" > 0),
     CONSTRAINT "config_extra_session_fee_check" CHECK ("extra_session_fee" >= 0),
@@ -183,7 +197,34 @@ CREATE TABLE IF NOT EXISTS "payments"."agent_sessions" (
 
 COMMENT ON TABLE "payments"."agent_sessions" IS 'Free agent runs from the loader''s MCP server, metered but never billed. active_seconds adds the time between heartbeats, each gap capped by the API (2 x its heartbeat interval), so a loader that stalls or crashes is not counted past it. No FKs, like sessions.';
 
+CREATE TABLE IF NOT EXISTS "payments"."referrals" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "referrer" "uuid" NOT NULL,
+    "invitee" "uuid" NOT NULL,
+    "discord_hash" "bytea" NOT NULL,
+    "eligible" boolean NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "gift_at" timestamp with time zone,
+    "runtime_scripts" "uuid"[] DEFAULT '{}'::"uuid"[] NOT NULL,
+    "invites" integer DEFAULT 0 NOT NULL,
+    "topped_up" boolean DEFAULT false NOT NULL,
+    "earned" bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT "referrals_self_check" CHECK ("referrer" <> "invitee"),
+    CONSTRAINT "referrals_progress_check" CHECK ("invites" >= 0 AND "earned" >= 0)
+);
+
 -- Keys
+
+ALTER TABLE ONLY "payments"."referrals"
+    ADD CONSTRAINT "referrals_pkey" PRIMARY KEY ("id");
+
+ALTER TABLE ONLY "payments"."referrals"
+    ADD CONSTRAINT "referrals_invitee_key" UNIQUE ("invitee");
+
+ALTER TABLE ONLY "payments"."referrals"
+    ADD CONSTRAINT "referrals_discord_hash_key" UNIQUE ("discord_hash");
+
+CREATE INDEX "referrals_referrer_idx" ON "payments"."referrals" USING "btree" ("referrer", "created_at" DESC);
 
 ALTER TABLE ONLY "payments"."agent_sessions"
     ADD CONSTRAINT "agent_sessions_pkey" PRIMARY KEY ("id");
@@ -870,6 +911,194 @@ END;
 $$;
 
 
+CREATE OR REPLACE FUNCTION "payments"."pay_referral"("p_user" "uuid", "p_amount" bigint, "p_note" "text") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+BEGIN
+  IF p_amount <= 0 OR NOT EXISTS (SELECT 1 FROM payments.accounts a WHERE a.user_id = p_user) THEN
+    RETURN 0;
+  END IF;
+
+  PERFORM payments.post_credits(p_user, 'referral', p_amount, NULL, NULL, NULL, p_note, NULL, NULL, p_amount);
+  RETURN p_amount;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."claim_referral"("p_code" "text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_referrer uuid;
+  v_discord_id text;
+  v_hash bytea;
+  v_created timestamptz;
+BEGIN
+  IF v_user IS NULL THEN
+    RAISE EXCEPTION 'not authenticated' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  SELECT p.id INTO v_referrer FROM profiles.profiles p
+  WHERE p.referral_code = lower(btrim(COALESCE(p_code, ''))) AND p.banned_at IS NULL;
+
+  IF v_referrer IS NULL THEN
+    RETURN 'invalid';
+  END IF;
+
+  IF v_referrer = v_user THEN
+    RETURN 'own';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('payments.referrals.' || v_user::text));
+
+  IF EXISTS (SELECT 1 FROM payments.referrals r WHERE r.invitee = v_user) THEN
+    RETURN 'already_referred';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM payments.referrals r WHERE r.referrer = v_user AND r.invitee = v_referrer) THEN
+    RETURN 'own';
+  END IF;
+
+  IF profiles.is_banned(v_user)
+     OR EXISTS (SELECT 1 FROM payments.sessions s WHERE s.user_id = v_user)
+     OR EXISTS (SELECT 1 FROM payments.agent_sessions s WHERE s.user_id = v_user)
+     OR EXISTS (SELECT 1 FROM payments.payments p WHERE p.user_id = v_user) THEN
+    RETURN 'not_new';
+  END IF;
+
+  SELECT i.provider_id INTO v_discord_id FROM auth.identities i
+  WHERE i.user_id = v_user AND i.provider = 'discord' AND i.provider_id ~ '^[0-9]{1,19}$'
+  LIMIT 1;
+
+  SELECT extensions.hmac(v_discord_id, s.decrypted_secret, 'sha256') INTO v_hash
+  FROM vault.decrypted_secrets s WHERE s.name = 'REFERRAL_SECRET' LIMIT 1;
+
+  IF v_hash IS NULL THEN
+    RETURN 'unavailable';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM payments.referrals r WHERE r.discord_hash = v_hash) THEN
+    RETURN 'already_referred';
+  END IF;
+
+  v_created := to_timestamp(((v_discord_id::bigint >> 22) + 1420070400000) / 1000.0);
+
+  INSERT INTO payments.referrals (referrer, invitee, discord_hash, eligible)
+  VALUES (v_referrer, v_user, v_hash,
+          v_created <= now() - make_interval(days => (SELECT c.referral_min_discord_days FROM payments.config c)));
+
+  RETURN 'claimed';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."reward_referral"("p_invitee" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_config payments.config;
+  v_referral payments.referrals;
+  v_parent payments.referrals;
+  v_qualified boolean;
+  v_scripts uuid[];
+  v_paid bigint;
+BEGIN
+  SELECT * INTO v_referral FROM payments.referrals r WHERE r.invitee = p_invitee FOR UPDATE;
+
+  IF NOT FOUND OR NOT v_referral.eligible OR profiles.is_banned(v_referral.referrer) OR profiles.is_banned(p_invitee) THEN
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_config FROM payments.config;
+  v_qualified := cardinality(v_referral.runtime_scripts) > 0 OR v_referral.topped_up;
+
+  IF cardinality(v_referral.runtime_scripts) < v_config.referral_runtime_scripts THEN
+    SELECT COALESCE(array_agg(q.script_id ORDER BY q.first_run), '{}'::uuid[]) INTO v_scripts
+    FROM (
+      SELECT s.script_id, min(s.started_at) AS first_run
+      FROM payments.sessions s
+      WHERE s.user_id = p_invitee AND s.author_id <> p_invitee AND s.ended_at IS NOT NULL
+        AND s.script_id <> ALL (v_referral.runtime_scripts)
+      GROUP BY s.script_id
+      HAVING sum(s.charged_minutes) >= v_config.referral_runtime_minutes
+         AND count(DISTINCT (s.started_at AT TIME ZONE 'UTC')::date) >= v_config.referral_runtime_days
+      ORDER BY first_run
+      LIMIT v_config.referral_runtime_scripts - cardinality(v_referral.runtime_scripts)
+    ) q;
+
+    IF cardinality(v_scripts) > 0 THEN
+      v_paid := payments.pay_referral(v_referral.referrer, v_config.referral_runtime_reward * cardinality(v_scripts), 'an invitee kept running a script');
+      UPDATE payments.referrals SET runtime_scripts = runtime_scripts || v_scripts, earned = earned + v_paid
+      WHERE id = v_referral.id RETURNING * INTO v_referral;
+    END IF;
+  END IF;
+
+  IF NOT v_referral.topped_up AND EXISTS (SELECT 1 FROM payments.payments p WHERE p.user_id = p_invitee AND p.status = 'paid'::payments.payment_status) THEN
+    v_paid := payments.pay_referral(v_referral.referrer, v_config.referral_topup_reward, 'an invitee topped up');
+    UPDATE payments.referrals SET topped_up = true, earned = earned + v_paid
+    WHERE id = v_referral.id RETURNING * INTO v_referral;
+  END IF;
+
+  IF v_qualified OR NOT (cardinality(v_referral.runtime_scripts) > 0 OR v_referral.topped_up) THEN
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_parent FROM payments.referrals r WHERE r.invitee = v_referral.referrer FOR UPDATE;
+
+  IF FOUND AND v_parent.eligible AND v_parent.invites < v_config.referral_invites AND NOT profiles.is_banned(v_parent.referrer) THEN
+    v_paid := payments.pay_referral(v_parent.referrer, v_config.referral_invite_reward, 'an invitee''s invitee qualified');
+    UPDATE payments.referrals SET invites = invites + 1, earned = earned + v_paid WHERE id = v_parent.id;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."grant_referral_gift"("p_user" "uuid") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+DECLARE
+  v_referral payments.referrals;
+  v_paid bigint;
+BEGIN
+  SELECT * INTO v_referral FROM payments.referrals r WHERE r.invitee = p_user FOR UPDATE;
+
+  IF NOT FOUND OR NOT v_referral.eligible OR v_referral.gift_at IS NOT NULL
+     OR profiles.is_banned(p_user) OR profiles.is_banned(v_referral.referrer) THEN
+    RETURN 0;
+  END IF;
+
+  v_paid := payments.pay_referral(p_user, (SELECT c.referral_gift FROM payments.config c), 'welcome gift');
+  UPDATE payments.referrals SET gift_at = now() WHERE id = v_referral.id;
+  RETURN v_paid;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION "payments"."list_referrals"() RETURNS TABLE ("id" "uuid", "created_at" timestamp with time zone, "eligible" boolean, "banned" boolean, "runtime_scripts" integer, "invites" integer, "topped_up" boolean, "earned" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT r.id, r.created_at, r.eligible, profiles.is_banned(r.invitee), cardinality(r.runtime_scripts), r.invites, r.topped_up, r.earned
+  FROM payments.referrals r
+  WHERE r.referrer = auth.uid()
+  ORDER BY r.created_at DESC;
+$$;
+
+
+CREATE OR REPLACE FUNCTION "payments"."own_referral"() RETURNS TABLE ("created_at" timestamp with time zone, "eligible" boolean, "gift_at" timestamp with time zone)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    SET "row_security" TO 'off'
+    AS $$
+  SELECT r.created_at, r.eligible, r.gift_at FROM payments.referrals r WHERE r.invitee = auth.uid();
+$$;
+
 -- Trigger functions
 
 CREATE OR REPLACE FUNCTION "payments"."tr_profiles_post_insert"() RETURNS "trigger"
@@ -879,6 +1108,17 @@ CREATE OR REPLACE FUNCTION "payments"."tr_profiles_post_insert"() RETURNS "trigg
 BEGIN
   INSERT INTO payments.accounts (user_id) VALUES (NEW.id);
   RETURN NEW;
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION "payments"."tr_referral_progress"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+BEGIN
+  PERFORM payments.reward_referral(NEW.user_id);
+  RETURN NULL;
 END;
 $$;
 
@@ -937,6 +1177,10 @@ $$;
 
 CREATE OR REPLACE TRIGGER "tr_payments_limit_pending" BEFORE INSERT ON "payments"."payments" FOR EACH ROW WHEN (NEW.status = 'pending') EXECUTE FUNCTION "payments"."tr_payments_limit_pending"();
 
+CREATE OR REPLACE TRIGGER "tr_sessions_referral" AFTER UPDATE OF "ended_at" ON "payments"."sessions" FOR EACH ROW WHEN (OLD."ended_at" IS NULL AND NEW."ended_at" IS NOT NULL) EXECUTE FUNCTION "payments"."tr_referral_progress"();
+
+CREATE OR REPLACE TRIGGER "tr_payments_referral" AFTER UPDATE OF "status" ON "payments"."payments" FOR EACH ROW WHEN (NEW."status" = 'paid'::"payments"."payment_status" AND OLD."status" <> 'paid'::"payments"."payment_status") EXECUTE FUNCTION "payments"."tr_referral_progress"();
+
 CREATE OR REPLACE TRIGGER "tr_accounts_pre_delete" BEFORE DELETE ON "payments"."accounts" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_accounts_pre_delete"();
 
 CREATE OR REPLACE TRIGGER "tr_profiles_post_insert" AFTER INSERT ON "profiles"."profiles" FOR EACH ROW EXECUTE FUNCTION "payments"."tr_profiles_post_insert"();
@@ -960,6 +1204,7 @@ ALTER TABLE "payments"."credits_ledger" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."earnings_ledger" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."sessions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "payments"."agent_sessions" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "payments"."referrals" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "SELECT for OWNER" ON "payments"."accounts" FOR SELECT TO "authenticated" USING ("user_id" = "profiles"."uid"());
 
@@ -976,11 +1221,11 @@ CREATE POLICY "SELECT for OWNER" ON "payments"."earnings_ledger" FOR SELECT TO "
 GRANT USAGE ON SCHEMA "payments" TO "authenticated";
 GRANT USAGE ON SCHEMA "payments" TO "service_role";
 
-REVOKE ALL ON TABLE "payments"."config", "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions" FROM "anon", "authenticated";
+REVOKE ALL ON TABLE "payments"."config", "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions", "payments"."referrals" FROM "anon", "authenticated";
 
 GRANT SELECT ON TABLE "payments"."accounts", "payments"."payments", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions" TO "authenticated";
 GRANT ALL ON TABLE "payments"."config", "payments"."payments" TO "service_role";
-GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions" TO "service_role";
+GRANT SELECT ON TABLE "payments"."accounts", "payments"."credits_ledger", "payments"."earnings_ledger", "payments"."sessions", "payments"."agent_sessions", "payments"."referrals" TO "service_role";
 
 REVOKE ALL ON FUNCTION "payments"."post_credits"("uuid", "payments"."credit_kind", bigint, "uuid", "uuid", integer, "text", "uuid", "uuid", bigint, bigint) FROM PUBLIC, "anon", "authenticated";
 REVOKE ALL ON FUNCTION "payments"."minutes_per_month"() FROM PUBLIC, "anon", "authenticated";
@@ -1031,3 +1276,14 @@ GRANT EXECUTE ON FUNCTION "payments"."heartbeat_agent_session"("uuid", "uuid", i
 GRANT EXECUTE ON FUNCTION "payments"."end_agent_session"("uuid", "uuid", integer) TO "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."transfer_earnings"(bigint) TO "authenticated", "service_role";
 GRANT EXECUTE ON FUNCTION "payments"."stop_session"("uuid") TO "authenticated", "service_role";
+REVOKE ALL ON FUNCTION "payments"."pay_referral"("uuid", bigint, "text") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."claim_referral"("text") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."reward_referral"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."grant_referral_gift"("uuid") FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."list_referrals"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."own_referral"() FROM PUBLIC, "anon", "authenticated";
+REVOKE ALL ON FUNCTION "payments"."tr_referral_progress"() FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "payments"."claim_referral"("text") TO "authenticated";
+GRANT EXECUTE ON FUNCTION "payments"."grant_referral_gift"("uuid") TO "service_role";
+GRANT EXECUTE ON FUNCTION "payments"."list_referrals"() TO "authenticated";
+GRANT EXECUTE ON FUNCTION "payments"."own_referral"() TO "authenticated";
