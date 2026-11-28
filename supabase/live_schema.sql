@@ -2407,6 +2407,24 @@ $$;
 ALTER FUNCTION "scripts"."live_manifest"("script_id" "uuid") OWNER TO "supabase_admin";
 
 
+CREATE OR REPLACE FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) RETURNS TABLE("id" "uuid", "revision" integer)
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT v.id, v.revision
+  FROM scripts.protected p
+  JOIN scripts.versions v ON v.id = p.id AND v.revision = p.revision
+  WHERE v.status = 'live'::scripts.version_status
+    AND v.checked_injector IS DISTINCT FROM p_injector
+    AND COALESCE((v.manifest ->> 'auto_forward')::boolean, true)
+  ORDER BY v.checked_at ASC NULLS FIRST
+  LIMIT p_limit;
+$$;
+
+
+ALTER FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) OWNER TO "supabase_admin";
+
+
 CREATE OR REPLACE FUNCTION "scripts"."max_stage"("script_id" "uuid", "target_stage" "scripts"."stage") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO ''
@@ -5433,6 +5451,12 @@ REVOKE ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") FROM PUBLIC
 GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "postgres";
 GRANT ALL ON FUNCTION "scripts"."live_manifest"("script_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) TO "postgres";
+GRANT ALL ON FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) TO "service_role";
 
 
 
