@@ -1,6 +1,6 @@
 BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
-SELECT plan(50);
+SELECT plan(53);
 
 CREATE FUNCTION pg_temp.signup(p_id uuid, p_name text, p_role profiles.roles DEFAULT 'user') RETURNS void
     LANGUAGE plpgsql AS $$
@@ -161,6 +161,12 @@ SELECT lives_ok($$SELECT scripts.publish_version('10000000-0000-0000-0000-000000
 RESET ROLE;
 SELECT ok(NOT pg_temp.broken(), 'and the script is no longer broken');
 SELECT ok(scripts.can_view('00000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001'), 'so users see it again');
+
+SET LOCAL ROLE authenticated;
+SELECT throws_ok($$SELECT * FROM scripts.live_revisions_to_check('2026.11.20-fffffff', 10)$$, '42501', NULL, 'an author cannot list the revisions to check');
+RESET ROLE;
+SELECT results_eq($$SELECT id, revision FROM scripts.live_revisions_to_check('2026.11.20-fffffff', 10)$$, $$VALUES ('10000000-0000-0000-0000-000000000001'::uuid, 3)$$, 'a newer release checks only the revision sessions run, not older live ones');
+SELECT is_empty($$SELECT * FROM scripts.live_revisions_to_check('2026.11.19-eeeeeee', 10)$$, 'nor one already checked against it');
 
 SELECT * FROM finish();
 ROLLBACK;

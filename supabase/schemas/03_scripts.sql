@@ -1185,6 +1185,20 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) RETURNS TABLE("id" "uuid", "revision" integer)
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO ''
+    AS $$
+  SELECT v.id, v.revision
+  FROM scripts.protected p
+  JOIN scripts.versions v ON v.id = p.id AND v.revision = p.revision
+  WHERE v.status = 'live'::scripts.version_status
+    AND v.checked_injector IS DISTINCT FROM p_injector
+    AND COALESCE((v.manifest ->> 'auto_forward')::boolean, true)
+  ORDER BY v.checked_at ASC NULLS FIRST
+  LIMIT p_limit;
+$$;
+
 -- Pending -> discarded; a service job deletes the files, never SQL on storage.objects
 CREATE OR REPLACE FUNCTION "scripts"."discard_version"("script_id" "uuid", "revision" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
@@ -1563,6 +1577,8 @@ REVOKE ALL ON FUNCTION "scripts"."register_injector"("p_version" "text", "p_buil
 GRANT EXECUTE ON FUNCTION "scripts"."register_injector"("p_version" "text", "p_build" bigint) TO "service_role";
 REVOKE ALL ON FUNCTION "scripts"."retire_injector"("p_version" "text") FROM PUBLIC, "anon", "authenticated";
 GRANT EXECUTE ON FUNCTION "scripts"."retire_injector"("p_version" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) FROM PUBLIC, "anon", "authenticated";
+GRANT EXECUTE ON FUNCTION "scripts"."live_revisions_to_check"("p_injector" "text", "p_limit" integer) TO "service_role";
 
 -- Lock down privileged functions; policy helpers stay callable by anon
 REVOKE ALL ON FUNCTION "scripts"."tr_scripts_set_url"() FROM PUBLIC, "anon", "authenticated";
